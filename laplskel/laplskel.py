@@ -829,25 +829,11 @@ def laplacian_skeletonisation(
 
     # Process each component independently if separate_streams is True
     if separate_streams:
-        CONN = {6: 1, 18: 2, 26: 3}
-        if label_connectivity not in CONN:
-            raise ValueError(
-                f'Label connectivity {label_connectivity} is not a valid option [6, 18, 26].'
-            )
-
-        labeled_volume, num_features = ndimage.label(
-            volume_data,
-            structure=ndimage.generate_binary_structure(3, CONN[label_connectivity]),
-        )
-        print(
-            f'Divided volume into {num_features} distinct label components '
-            f'({label_connectivity}-connectivity).'
+        labeled_volume, num_features = label_and_sort_by_size(
+            volume_data, label_connectivity
         )
     else:
         labeled_volume, num_features = volume_data * 1, 1
-
-    contracted_X_list = []
-    adj_list = []
 
     total_cores = os.cpu_count() or 1
     if n_jobs is None or n_jobs <= 0:
