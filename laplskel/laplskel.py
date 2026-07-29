@@ -8,7 +8,7 @@ import numpy as np
 from joblib import delayed
 from nigsp import io
 from scipy import ndimage, sparse
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import cg, spsolve
 from scipy.spatial import KDTree
 from tqdm_joblib import ParallelPbar
 
@@ -338,6 +338,7 @@ def laplacian_graph_contraction_edt(
     min_edge_length=0.5,
     alpha_norm=1.5,
     alpha_tang=0.1,
+    solver='CG',
 ):
     """
     Carry out Laplacian Flow Dynamics.
@@ -389,6 +390,10 @@ def laplacian_graph_contraction_edt(
     alpha_tang : float, optional
         The tangential/longitudinal orientation penalty parameter used during anisotropic calculation phases.
         Default is 0.1.
+    solver : ['LU', 'CG'], string, optional
+        The solver to use to solve the linear system Ax = b. LU uses SuperLU, a direct
+        solver, CG uses Conjugate Gradient (iterative solver), better for memory on big data.
+
 
     Returns
     -------
@@ -462,12 +467,23 @@ def laplacian_graph_contraction_edt(
             W_H_sq = sparse.eye(n_vertices, format='csr') * (w_H_base**2)
 
         # 3. Solve Implicit Update System equations
-        A = (w_L**2) * L_squared + W_H_sq
-        B = W_H_sq.dot(X)
+        if solver == 'LU':
+            A = (w_L**2) * L_squared + W_H_sq
+            B = W_H_sq.dot(X)
 
-        X_next = np.zeros_like(X)
-        for dim in range(3):
-            X_next[:, dim] = spsolve(A, B[:, dim])
+            X_next = np.zeros_like(X)
+            for dim in range(3):
+                X_next[:, dim] = spsolve(A, B[:, dim])
+        elif solver == 'CG':
+            A = (w_L**2) * L_squared + W_H_sq
+            B = W_H_sq.dot(X)
+
+            X_next = np.zeros_like(X)
+            for dim in range(3):
+                # Use CG with the previous coordinate array as a warm start (x0)
+                # tol=1e-4 is plenty accurate for contraction steps
+                sol, info = cg(A, B[:, dim], x0=X[:, dim], tol=1e-4, maxiter=500)
+                X_next[:, dim] = sol
 
         # 4. Explicit Hard-Voxel Containment Constraint Projection
         if enforce_containment:
