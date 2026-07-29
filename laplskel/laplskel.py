@@ -216,17 +216,12 @@ def compute_laplacian_matrix(
     if use_anisotropic:
         # Estimate local structural tangents using local neighborhood PCA proxy
         tangents = np.zeros_like(X)
-
-        indptr = adjacency_matrix.indptr
-        indices = adjacency_matrix.indices
-
         for i in range(n_vertices):
-            nbr_idx = indices[indptr[i] : indptr[i + 1]]
-            if len(nbr_idx) > 2:
-                pts = X[nbr_idx] - X[i]
-                # Fast 3x3 SVD / Eigen decomposition without np.cov overhead
-                _, _, vh = np.linalg.svd(pts, full_matrices=False)
-                tangents[i] = vh[0]  # Principal direction
+            neighbors = cols[rows == i]
+            if len(neighbors) > 1:
+                cov = np.cov(X[neighbors].T)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                tangents[i] = eigvecs[:, -1]  # Principal directional eigenvector
             else:
                 tangents[i] = np.array([1.0, 0.0, 0.0])
 
