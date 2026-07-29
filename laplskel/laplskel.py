@@ -532,38 +532,6 @@ def laplacian_graph_contraction_edt(
     return X, adj
 
 
-def coords_to_dense_3d(X, volume_shape):
-    """
-    Create and fill in a volume using coordinates of points.
-
-    Parameters
-    ----------
-    X : ndarray of shape (N, 3)
-        The 3D coordinates of the areas with content.
-    volume_shape : tuple of int (D, H, W)
-        The structural grid dimensions of the target 3D matrix.
-
-    Returns
-    -------
-    dense_volume : ndarray of shape (D, H, W)
-        A binary 3D array where 1 represents the skeleton path.
-    """
-    # 1. Initialize empty dense matrix
-    dense_volume = np.zeros(volume_shape, dtype=bool)
-
-    coords = np.rint(X).astype(np.int8)
-
-    # 2. Fix coordinates on boundaries due to numpy's round-to-even
-    for dim, bound in enumerate(volume_shape):
-        coords[:, dim][coords[:, dim] == bound] = bound - 1
-
-    # 3. Rasterize edges and nodes into the grid
-    for i in coords:
-        dense_volume[tuple(i)] = True
-
-    return dense_volume
-
-
 def compute_sparse_adjacency_matrix(tree, max_distance=2.4999):
     """
     Compute sparse adjacency matrix.
@@ -739,6 +707,38 @@ def label_and_sort_by_size(binary_mask, label_connectivity=6):
     mapping[sorted_labels] = np.arange(1, num_features + 1)
 
     return mapping[labeled_volume], num_features
+
+
+def coords_to_dense_3d(X, volume_shape):
+    """
+    Create and fill in a volume using coordinates of points.
+
+    Parameters
+    ----------
+    X : ndarray of shape (N, 3)
+        The 3D coordinates of the areas with content.
+    volume_shape : tuple of int (D, H, W)
+        The structural grid dimensions of the target 3D matrix.
+
+    Returns
+    -------
+    dense_volume : ndarray of shape (D, H, W)
+        A binary 3D array where 1 represents the skeleton path.
+    """
+    # 1. Initialize empty dense matrix
+    dense_volume = np.zeros(volume_shape, dtype=bool)
+
+    coords = np.rint(X).astype(np.int8)
+
+    # 2. Fix coordinates on boundaries due to numpy's round-to-even
+    for dim, bound in enumerate(volume_shape):
+        coords[:, dim][coords[:, dim] == bound] = bound - 1
+
+    # 3. Rasterize edges and nodes into the grid
+    for i in coords:
+        dense_volume[tuple(i)] = True
+
+    return dense_volume
 
 
 def laplacian_skeletonisation(
