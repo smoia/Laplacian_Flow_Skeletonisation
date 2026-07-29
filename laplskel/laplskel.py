@@ -483,7 +483,7 @@ def laplacian_graph_contraction_edt(
             for dim in range(3):
                 # Use CG with the previous coordinate array as a warm start (x0)
                 # tol=1e-4 is plenty accurate for contraction steps
-                sol, info = cg(A, B[:, dim], x0=X[:, dim], tol=1e-4, maxiter=500)
+                sol, info = cg(A, B[:, dim], x0=X[:, dim], rtol=1e-4, maxiter=500)
                 X_next[:, dim] = sol
 
         # 4. Explicit Hard-Voxel Containment Constraint Projection
