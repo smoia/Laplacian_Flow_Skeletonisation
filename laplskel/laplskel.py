@@ -559,7 +559,7 @@ def compute_sparse_adjacency_matrix(tree, max_distance=2.4999):
 
 def _process_single_label(
     label_id,
-    segment,
+    labeled_volume,
     use_edt,
     use_anisotropic,
     enforce_containment,
@@ -579,8 +579,8 @@ def _process_single_label(
     ----------
     label_id : int
         ID of current label
-    segment : np.ndarray
-        One labelled segment from scipy's label.
+    labeled_volume : np.ndarray
+        Segmentation labelled with scipy's label.
     use_edt : bool
         Enables boundary tracking potential constraints using Euclidean Distance Transforms.
     use_anisotropic : bool
@@ -621,6 +621,7 @@ def _process_single_label(
     final_adj : scipy.sparse.csr_matrix
         The resulting graph sparse adjacency connectivity representation of shape (M, M).
     """
+    segment = labeled_volume == label_id
     X_init = np.argwhere(segment).astype(float)
     tree = KDTree(X_init)
 
@@ -727,7 +728,7 @@ def coords_to_dense_3d(X, volume_shape):
     # 1. Initialize empty dense matrix
     dense_volume = np.zeros(volume_shape, dtype=bool)
 
-    coords = np.rint(X).astype(np.int16)
+    coords = np.rint(X).astype(np.int8)
 
     # 2. Fix coordinates on boundaries due to numpy's round-to-even
     for dim, bound in enumerate(volume_shape):
@@ -861,16 +862,10 @@ def laplacian_skeletonisation(
         f'on {total_cores} CPU cores detected.'
     )
 
-    tasks = []
-    for label_id in range(1, num_features + 1):
-        tasks.append((label_id, labeled_volume == label_id))
-
-    results = ParallelPbar('Skeletonising')(
-        n_jobs=n_workers, max_nbytes='1M', mmap_mode='r'
-    )(
+    results = ParallelPbar('Skeletonising')(n_jobs=n_workers)(
         delayed(_process_single_label)(
             label_id,
-            segment,
+            labeled_volume,
             use_edt,
             use_anisotropic,
             enforce_containment,
@@ -883,7 +878,7 @@ def laplacian_skeletonisation(
             min_edge_length,
             num_features,
         )
-        for label_id, segment in tasks
+        for label_id in range(1, num_features + 1)
     )
 
     print('Reuniting results from parallel jobs.')
