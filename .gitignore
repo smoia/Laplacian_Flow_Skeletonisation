@@ -137,8 +137,6 @@ dmypy.json
 # macOS
 .DS_Store
 
+# Local agent context
 AGENTS.md
 LOG.md
-laplskel/tests/*
-
-.vscode/

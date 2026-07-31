@@ -1,35 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import os
 import sys
-import xml.etree.ElementTree as ET
+import tempfile
 
 import numpy as np
 from joblib import delayed
 from nigsp import io
 from scipy import ndimage, sparse
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import cg, spsolve
 from scipy.spatial import KDTree
 from tqdm_joblib import ParallelPbar
-
-
-VALID_CONNECTIVITIES = (6, 18, 26)
-GRAPHML_NAMESPACE = 'http://graphml.graphdrawing.org/xmlns'
-GRAPHML_XSI_NAMESPACE = 'http://www.w3.org/2001/XMLSchema-instance'
-
-
-def _positive_finite_float(value):
-    """Parse a finite, strictly positive floating-point command-line value."""
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError("must be a floating-point number")
-
-    if not np.isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError("must be finite and strictly positive")
-    return parsed
 
 
 def _get_parser():
@@ -136,6 +118,15 @@ def _get_parser():
         ),
     )
     optional.add_argument(
+        '--max_distance_adjmat',
+        dest='max_distance',
+        type=float,
+        default=2.4999,
+        help=(
+            'Maximum distance to consider when computing the sparse adjacency matrix.'
+        ),
+    )
+    optional.add_argument(
         '--separate_streams',
         action='store_true',
         help=(
@@ -146,22 +137,9 @@ def _get_parser():
     optional.add_argument(
         '--label_connectivity',
         type=int,
-        choices=VALID_CONNECTIVITIES,
+        choices=[6, 18, 26],
         default=6,
         help='Neighborhood connectivity structure for labeling (6, 18, or 26) [Default=6].',
-    )
-    optional.add_argument(
-        "--initial_connectivity",
-        type=int,
-        choices=VALID_CONNECTIVITIES,
-        default=26,
-        help="Voxel connectivity for the initial graph (6, 18, or 26) [Default=26].",
-    )
-    optional.add_argument(
-        "--pca_radius",
-        type=_positive_finite_float,
-        default=2.5,
-        help="Spatial radius used for local PCA tangent estimation [Default=2.5].",
     )
     optional.add_argument(
         '--n_jobs',
@@ -189,150 +167,8 @@ def _get_parser():
     return parser
 
 
-def _validate_initial_connectivity(initial_connectivity):
-    """Validate and normalize an initial voxel-graph connectivity value."""
-    if (
-        isinstance(initial_connectivity, (bool, np.bool_))
-        or initial_connectivity not in VALID_CONNECTIVITIES
-    ):
-        raise ValueError(
-            f"Initial connectivity {initial_connectivity} is not a valid option "
-            f"{list(VALID_CONNECTIVITIES)}."
-        )
-    return int(initial_connectivity)
-
-
-def _validate_pca_radius(pca_radius):
-    """Validate and normalize the PCA neighbourhood radius."""
-    if isinstance(pca_radius, (bool, np.bool_)) or not np.isscalar(pca_radius):
-        raise ValueError("pca_radius must be finite and strictly positive.")
-    try:
-        pca_radius = float(pca_radius)
-    except (TypeError, ValueError):
-        raise ValueError("pca_radius must be finite and strictly positive.")
-    if not np.isfinite(pca_radius) or pca_radius <= 0:
-        raise ValueError("pca_radius must be finite and strictly positive.")
-    return pca_radius
-
-
-def _build_initial_adjacency(X, initial_connectivity):
-    """Build a sparse voxel graph with the requested 3D connectivity."""
-    initial_connectivity = _validate_initial_connectivity(initial_connectivity)
-    max_squared_distance = {6: 1, 18: 2, 26: 3}[initial_connectivity]
-
-    coordinate_to_index = {tuple(coordinate): i for i, coordinate in enumerate(X)}
-    offsets = []
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dz in (-1, 0, 1):
-                squared_distance = dx * dx + dy * dy + dz * dz
-                if not 0 < squared_distance <= max_squared_distance:
-                    continue
-                # Retain one orientation for each undirected voxel pair.
-                if (dx, dy, dz) > (0, 0, 0):
-                    offsets.append((dx, dy, dz))
-
-    rows = []
-    cols = []
-    for i, coordinate in enumerate(X):
-        for offset in offsets:
-            neighbour = tuple(coordinate + offset)
-            j = coordinate_to_index.get(neighbour)
-            if j is not None:
-                rows.extend((i, j))
-                cols.extend((j, i))
-
-    data = np.ones(len(rows), dtype=bool)
-    return sparse.csr_matrix(
-        (data, (rows, cols)), shape=(X.shape[0], X.shape[0]), dtype=bool
-    )
-
-
-def _principal_tangent(samples):
-    """Return the principal axis of samples, or None for degenerate samples."""
-    if samples.shape[0] < 2:
-        return None
-
-    centered = samples - samples.mean(axis=0)
-    covariance = centered.T @ centered
-    if not np.all(np.isfinite(covariance)) or not np.any(covariance):
-        return None
-
-    try:
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    except np.linalg.LinAlgError:
-        return None
-    if eigenvalues[-1] <= np.finfo(float).eps:
-        return None
-
-    tangent = eigenvectors[:, -1]
-    norm = np.linalg.norm(tangent)
-    if not np.isfinite(norm) or norm <= np.finfo(float).eps:
-        return None
-    return tangent / norm
-
-
-def _graph_fallback_tangent(X, adjacency_matrix, node):
-    """Estimate a first-iteration tangent from graph-adjacent nodes."""
-    neighbours = adjacency_matrix.getrow(node).indices
-    neighbours = neighbours[neighbours != node]
-    tangent = _principal_tangent(X[neighbours])
-    if tangent is not None:
-        return tangent
-
-    if neighbours.size == 1:
-        direction = X[neighbours[0]] - X[node]
-        norm = np.linalg.norm(direction)
-        if np.isfinite(norm) and norm > np.finfo(float).eps:
-            return direction / norm
-    return np.zeros(3, dtype=float)
-
-
-def _estimate_local_tangents(
-    X, adjacency_matrix, pca_radius, previous_tangents=None
-):
-    """Estimate tangents using radius queries on the current coordinates."""
-    pca_radius = _validate_pca_radius(pca_radius)
-    if previous_tangents is not None and previous_tangents.shape != X.shape:
-        raise ValueError("previous_tangents must have the same shape as X.")
-
-    # Coordinates contract on every solver step, so this tree must not be reused
-    # between calls.
-    tree = KDTree(X)
-    radius_neighbours = tree.query_ball_point(X, r=pca_radius)
-    tangents = np.zeros_like(X, dtype=float)
-
-    for node, neighbours in enumerate(radius_neighbours):
-        # PCA samples are neighbouring points only; never include the query node.
-        neighbours = np.asarray(
-            [neighbour for neighbour in neighbours if neighbour != node], dtype=int
-        )
-        tangent = _principal_tangent(X[neighbours])
-
-        if tangent is None:
-            if previous_tangents is None:
-                tangent = _graph_fallback_tangent(X, adjacency_matrix, node)
-            else:
-                tangent = previous_tangents[node].copy()
-
-        if previous_tangents is not None and np.dot(
-            tangent, previous_tangents[node]
-        ) < 0:
-            tangent = -tangent
-        tangents[node] = tangent
-
-    return tangents
-
-
 def compute_laplacian_matrix(
-    X,
-    adjacency_matrix,
-    use_anisotropic=True,
-    alpha_norm=1.5,
-    alpha_tang=0.1,
-    pca_radius=2.5,
-    previous_tangents=None,
-    return_tangents=False,
+    X, adjacency_matrix, use_anisotropic=True, alpha_norm=1.5, alpha_tang=0.1
 ):
     """
     Compute the Graph Laplacian Matrix L = D - W.
@@ -361,27 +197,13 @@ def compute_laplacian_matrix(
     alpha_tang : float, optional
         The scaling coefficient penalty assigned to tangential (longitudinal direction)
         displacement components when `use_anisotropic` is active. Default is 0.1.
-    pca_radius : float, optional
-        Finite, strictly positive spatial radius used to select local PCA samples.
-        Default is 2.5.
-    previous_tangents : numpy.ndarray, optional
-        An (N, 3) array of tangents from the preceding contraction iteration, used
-        when a node has insufficient or degenerate PCA samples. On the first
-        iteration, graph-adjacent neighbours are used instead. Default is None.
-    return_tangents : bool, optional
-        If True, return the estimated tangent array alongside the Laplacian.
-        Default is False.
 
     Returns
     -------
     L : scipy.sparse.csr_matrix
         The calculated sparse Graph Laplacian Matrix of shape (N, N) governed
         by the equation L = D - W.
-    tangents : numpy.ndarray, optional
-        The (N, 3) tangent array, returned with `L` only when
-        `return_tangents=True`.
     """
-    pca_radius = _validate_pca_radius(pca_radius)
     n_vertices = X.shape[0]
 
     # Get row and col indices from the sparse adjacency matrix
@@ -393,12 +215,16 @@ def compute_laplacian_matrix(
     distances = np.maximum(distances, 1e-6)  # Prevent division by zero
 
     if use_anisotropic:
-        tangents = _estimate_local_tangents(
-            X,
-            adjacency_matrix,
-            pca_radius,
-            previous_tangents=previous_tangents,
-        )
+        # Estimate local structural tangents using local neighborhood PCA proxy
+        tangents = np.zeros_like(X)
+        for i in range(n_vertices):
+            neighbors = cols[rows == i]
+            if len(neighbors) > 1:
+                cov = np.cov(X[neighbors].T)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                tangents[i] = eigvecs[:, -1]  # Principal directional eigenvector
+            else:
+                tangents[i] = np.array([1.0, 0.0, 0.0])
 
         t_i = tangents[rows]
         dot_products = np.sum(diffs * t_i, axis=1)
@@ -424,17 +250,10 @@ def compute_laplacian_matrix(
         shape=(n_vertices, n_vertices),
     )
 
-    laplacian = D - W
-    if return_tangents:
-        if not use_anisotropic:
-            tangents = previous_tangents
-        return laplacian, tangents
-    return laplacian
+    return D - W
 
 
-def edge_collapse_decimation(
-    X, adjacency_matrix, min_edge_length, return_retained_indices=False
-):
+def edge_collapse_decimation(X, adjacency_matrix, min_edge_length):
     """
     Perform structural decimation (E-collapse).
 
@@ -452,9 +271,6 @@ def edge_collapse_decimation(
     min_edge_length : float
         The structural distance threshold. Any edge with a Euclidean length shorter
         than this value will be collapsed.
-    return_retained_indices : bool, optional
-        If True, also return the original indices retained by decimation.
-        Default is False.
 
     Returns
     -------
@@ -464,9 +280,6 @@ def edge_collapse_decimation(
     new_adj : scipy.sparse.csr_matrix
         A simplified sparse CSR adjacency matrix of shape (M, M) with self-loops
         and duplicate edges removed.
-    unique_verts : numpy.ndarray, optional
-        Original indices corresponding to the retained vertices, returned only
-        when `return_retained_indices=True`.
     """
     n_vertices = X.shape[0]
     rows, cols = adjacency_matrix.nonzero()
@@ -506,8 +319,6 @@ def edge_collapse_decimation(
         (new_data, (new_rows, new_cols)), shape=(len(unique_verts), len(unique_verts))
     )
 
-    if return_retained_indices:
-        return new_X, new_adj, unique_verts
     return new_X, new_adj
 
 
@@ -528,7 +339,7 @@ def laplacian_graph_contraction_edt(
     min_edge_length=0.5,
     alpha_norm=1.5,
     alpha_tang=0.1,
-    pca_radius=2.5,
+    solver='CG',
 ):
     """
     Carry out Laplacian Flow Dynamics.
@@ -580,9 +391,10 @@ def laplacian_graph_contraction_edt(
     alpha_tang : float, optional
         The tangential/longitudinal orientation penalty parameter used during anisotropic calculation phases.
         Default is 0.1.
-    pca_radius : float, optional
-        Finite, strictly positive spatial radius used to select local PCA tangent
-        samples. Default is 2.5.
+    solver : ['LU', 'CG'], string, optional
+        The solver to use to solve the linear system Ax = b. LU uses SuperLU, a direct
+        solver, CG uses Conjugate Gradient (iterative solver), better for memory on big data.
+
 
     Returns
     -------
@@ -591,10 +403,8 @@ def laplacian_graph_contraction_edt(
     adj : scipy.sparse.csr_matrix
         Decimated skeleton topology graph connectivity representation of shape (M, M).
     """
-    pca_radius = _validate_pca_radius(pca_radius)
     X = X_init.copy().astype(float)
     adj = adj_init.copy()
-    previous_tangents = None
 
     # Conditional 3D EDT & Hard-Voxel Constraint Lookup Precomputation
     edt_volume = None
@@ -634,15 +444,12 @@ def laplacian_graph_contraction_edt(
         n_vertices = X.shape[0]
 
         # 1. Compute chosen Laplacian variant
-        L, current_tangents = compute_laplacian_matrix(
+        L = compute_laplacian_matrix(
             X,
             adj,
             use_anisotropic=use_anisotropic,
             alpha_norm=alpha_norm,
             alpha_tang=alpha_tang,
-            pca_radius=pca_radius,
-            previous_tangents=previous_tangents,
-            return_tangents=True,
         )
         L_squared = L.dot(L)
 
@@ -661,12 +468,23 @@ def laplacian_graph_contraction_edt(
             W_H_sq = sparse.eye(n_vertices, format='csr') * (w_H_base**2)
 
         # 3. Solve Implicit Update System equations
-        A = (w_L**2) * L_squared + W_H_sq
-        B = W_H_sq.dot(X)
+        if solver == 'LU':
+            A = (w_L**2) * L_squared + W_H_sq
+            B = W_H_sq.dot(X)
 
-        X_next = np.zeros_like(X)
-        for dim in range(3):
-            X_next[:, dim] = spsolve(A, B[:, dim])
+            X_next = np.zeros_like(X)
+            for dim in range(3):
+                X_next[:, dim] = spsolve(A, B[:, dim])
+        elif solver == 'CG':
+            A = (w_L**2) * L_squared + W_H_sq
+            B = W_H_sq.dot(X)
+
+            X_next = np.zeros_like(X)
+            for dim in range(3):
+                # Use CG with the previous coordinate array as a warm start (x0)
+                # tol=1e-4 is plenty accurate for contraction steps
+                sol, info = cg(A, B[:, dim], x0=X[:, dim], rtol=1e-4, maxiter=500)
+                X_next[:, dim] = sol
 
         # 4. Explicit Hard-Voxel Containment Constraint Projection
         if enforce_containment:
@@ -699,7 +517,6 @@ def laplacian_graph_contraction_edt(
 
         displacement = np.mean(np.linalg.norm(X_next - X, axis=1))
         X = X_next
-        previous_tangents = current_tangents
 
         print(
             f'Iter {i + 1}/{max_iter} - Remaining Nodes: {X.shape[0]} - '
@@ -711,275 +528,40 @@ def laplacian_graph_contraction_edt(
             break
 
         if (i + 1) % decimate_every == 0:
-            X, adj, retained_indices = edge_collapse_decimation(
-                X,
-                adj,
-                min_edge_length,
-                return_retained_indices=True,
-            )
-            if previous_tangents is not None:
-                previous_tangents = previous_tangents[retained_indices]
+            X, adj = edge_collapse_decimation(X, adj, min_edge_length)
 
     return X, adj
 
 
-def coords_to_dense_3d(X, volume_shape):
+def compute_sparse_adjacency_matrix(tree, max_distance=2.4999):
     """
-    Create and fill in a volume using coordinates of points.
+    Compute sparse adjacency matrix.
 
     Parameters
     ----------
-    X : ndarray of shape (N, 3)
-        The 3D coordinates of the areas with content.
-    volume_shape : tuple of int (D, H, W)
-        The structural grid dimensions of the target 3D matrix.
+    tree : scipy.spatial.KDTree
+        The tree initialised from X_init
+    max_distance : float, optional
+        Max distance to consider in the tree to compute the adj matrix
 
     Returns
     -------
-    dense_volume : ndarray of shape (D, H, W)
-        A binary 3D array where 1 represents the skeleton path.
+    adj_sparse : scipy.sparse.csr_matrix
+        Sparse adjacency matrix
     """
-    # 1. Initialize empty dense matrix
-    dense_volume = np.zeros(volume_shape, dtype=bool)
+    # Returns a sparse adjacency matrix directly for distances strictly within radius (0, 2.5)
+    adj_sparse = tree.sparse_distance_matrix(tree, max_distance=max_distance).tocsr()
+    # Remove self-loops (distance == 0 on diagonal)
+    adj_sparse.setdiag(0)
+    adj_sparse.eliminate_zeros()
 
-    coords = np.rint(X).astype(np.int8)
-
-    # 2. Fix coordinates on boundaries due to numpy's round-to-even
-    for dim, bound in enumerate(volume_shape):
-        coords[:, dim][coords[:, dim] == bound] = bound - 1
-
-    # 3. Rasterize edges and nodes into the grid
-    for i in coords:
-        dense_volume[tuple(i)] = True
-
-    return dense_volume
-
-
-def _clip_voxel(voxel, volume_shape):
-    """Clip one integer voxel coordinate to the target volume bounds."""
-    clipped = np.clip(
-        np.asarray(voxel, dtype=int),
-        0,
-        np.asarray(volume_shape, dtype=int) - 1,
-    )
-    return tuple(int(value) for value in clipped)
-
-
-def _edge_voxels(start, end, volume_shape):
-    """Return an endpoint-inclusive 26-connected voxel run for one graph edge."""
-    start = np.rint(np.asarray(start, dtype=float)).astype(int)
-    end = np.rint(np.asarray(end, dtype=float)).astype(int)
-    delta = end - start
-    steps = int(np.max(np.abs(delta)))
-    if steps == 0:
-        return [_clip_voxel(start, volume_shape)]
-
-    voxels = []
-    for step in range(steps + 1):
-        point = np.rint(start + delta * (step / steps)).astype(int)
-        voxel = _clip_voxel(point, volume_shape)
-        if not voxels or voxels[-1] != voxel:
-            voxels.append(voxel)
-    return voxels
-
-
-def _graphml_tag(name):
-    """Return a GraphML namespace-qualified XML tag."""
-    return f'{{{GRAPHML_NAMESPACE}}}{name}'
-
-
-def _add_graphml_data(element, key, value):
-    """Append one GraphML data element."""
-    data = ET.SubElement(element, _graphml_tag('data'), {'key': key})
-    data.text = str(value)
-
-
-def _indent_xml(element, level=0):
-    """Indent an ElementTree in Python versions without ``ET.indent``."""
-    indentation = '\n' + level * '  '
-    if len(element):
-        if not element.text or not element.text.strip():
-            element.text = indentation + '  '
-        for child in element:
-            _indent_xml(child, level + 1)
-        if not child.tail or not child.tail.strip():
-            child.tail = indentation
-    if level and (not element.tail or not element.tail.strip()):
-        element.tail = indentation
-
-
-def write_graphml(
-    X,
-    adjacency_matrix,
-    component_labels,
-    affine,
-    volume_shape,
-    output_path,
-):
-    """
-    Write a contracted graph using the SkelHub Laplacian GraphML schema.
-
-    Each edge stores a rounded, clipped, endpoint-inclusive 26-connected voxel
-    run in ``centerline_voxels``. Node radius is intentionally omitted.
-    """
-    X = np.asarray(X, dtype=float)
-    component_labels = np.asarray(component_labels, dtype=int)
-    affine = np.asarray(affine, dtype=float)
-    volume_shape = tuple(int(bound) for bound in volume_shape)
-
-    if X.ndim != 2 or X.shape[1] != 3:
-        raise ValueError('X must have shape (N, 3).')
-    if adjacency_matrix.shape != (X.shape[0], X.shape[0]):
-        raise ValueError('adjacency_matrix shape must match the number of nodes.')
-    if component_labels.shape != (X.shape[0],):
-        raise ValueError('component_labels must contain one label per node.')
-    if affine.shape != (4, 4):
-        raise ValueError('affine must have shape (4, 4).')
-    if len(volume_shape) != 3 or any(bound <= 0 for bound in volume_shape):
-        raise ValueError('volume_shape must contain three positive dimensions.')
-
-    ET.register_namespace('', GRAPHML_NAMESPACE)
-    ET.register_namespace('xsi', GRAPHML_XSI_NAMESPACE)
-    root = ET.Element(
-        _graphml_tag('graphml'),
-        {
-            f'{{{GRAPHML_XSI_NAMESPACE}}}schemaLocation': (
-                f'{GRAPHML_NAMESPACE} {GRAPHML_NAMESPACE}/1.0/graphml.xsd'
-            )
-        },
-    )
-    root.append(ET.Comment(' Created by laplskel '))
-
-    key_definitions = (
-        ('v_name', 'node', 'name', 'string'),
-        ('v_laplacian_id', 'node', 'laplacian_id', 'double'),
-        ('v_X', 'node', 'X', 'double'),
-        ('v_Y', 'node', 'Y', 'double'),
-        ('v_Z', 'node', 'Z', 'double'),
-        ('v_voxel_pos', 'node', 'voxel_pos', 'string'),
-        ('v_component_index', 'node', 'component_index', 'double'),
-        ('v_component_label', 'node', 'component_label', 'double'),
-        ('v_id', 'node', 'id', 'string'),
-        ('e_laplacian_edge_id', 'edge', 'laplacian_edge_id', 'double'),
-        (
-            'e_source_laplacian_id',
-            'edge',
-            'source_laplacian_id',
-            'double',
-        ),
-        (
-            'e_target_laplacian_id',
-            'edge',
-            'target_laplacian_id',
-            'double',
-        ),
-        ('e_centerline_voxels', 'edge', 'centerline_voxels', 'string'),
-        (
-            'e_num_centerline_voxels',
-            'edge',
-            'num_centerline_voxels',
-            'double',
-        ),
-        ('e_component_index', 'edge', 'component_index', 'double'),
-        ('e_component_label', 'edge', 'component_label', 'double'),
-        (
-            'e_component_edge_index',
-            'edge',
-            'component_edge_index',
-            'double',
-        ),
-    )
-    for key_id, scope, attribute_name, attribute_type in key_definitions:
-        ET.SubElement(
-            root,
-            _graphml_tag('key'),
-            {
-                'id': key_id,
-                'for': scope,
-                'attr.name': attribute_name,
-                'attr.type': attribute_type,
-            },
-        )
-
-    graph = ET.SubElement(
-        root,
-        _graphml_tag('graph'),
-        {'id': 'G', 'edgedefault': 'undirected'},
-    )
-    for node_id, (voxel_pos, component_label) in enumerate(
-        zip(X, component_labels)
-    ):
-        node_name = f'n{node_id}'
-        node = ET.SubElement(graph, _graphml_tag('node'), {'id': node_name})
-        world_pos = (affine @ np.append(voxel_pos, 1.0))[:3]
-        node_values = (
-            ('v_name', node_id),
-            ('v_laplacian_id', node_id),
-            ('v_X', float(world_pos[0])),
-            ('v_Y', float(world_pos[1])),
-            ('v_Z', float(world_pos[2])),
-            (
-                'v_voxel_pos',
-                json.dumps(voxel_pos.tolist(), separators=(',', ':')),
-            ),
-            ('v_component_index', int(component_label)),
-            ('v_component_label', int(component_label)),
-            ('v_id', node_name),
-        )
-        for key, value in node_values:
-            _add_graphml_data(node, key, value)
-
-    undirected_adjacency = adjacency_matrix.maximum(adjacency_matrix.T)
-    upper_adjacency = sparse.triu(undirected_adjacency, k=1, format='coo')
-    edge_order = np.lexsort((upper_adjacency.col, upper_adjacency.row))
-    component_edge_indices = {}
-    for edge_id, edge_position in enumerate(edge_order):
-        source = int(upper_adjacency.row[edge_position])
-        target = int(upper_adjacency.col[edge_position])
-        component_label = int(component_labels[source])
-        if component_label != int(component_labels[target]):
-            raise ValueError('Graph edges cannot connect different components.')
-
-        component_edge_index = component_edge_indices.get(component_label, 0)
-        component_edge_indices[component_label] = component_edge_index + 1
-        centerline_voxels = _edge_voxels(
-            X[source],
-            X[target],
-            volume_shape,
-        )
-
-        edge = ET.SubElement(
-            graph,
-            _graphml_tag('edge'),
-            {'source': f'n{source}', 'target': f'n{target}'},
-        )
-        edge_values = (
-            ('e_laplacian_edge_id', edge_id),
-            ('e_source_laplacian_id', source),
-            ('e_target_laplacian_id', target),
-            (
-                'e_centerline_voxels',
-                json.dumps(centerline_voxels, separators=(',', ':')),
-            ),
-            ('e_num_centerline_voxels', len(centerline_voxels)),
-            ('e_component_index', component_label),
-            ('e_component_label', component_label),
-            ('e_component_edge_index', component_edge_index),
-        )
-        for key, value in edge_values:
-            _add_graphml_data(edge, key, value)
-
-    _indent_xml(root)
-    ET.ElementTree(root).write(
-        output_path,
-        encoding='utf-8',
-        xml_declaration=True,
-    )
+    return (adj_sparse > 0).astype(bool)
 
 
 def _process_single_label(
     label_id,
-    labeled_volume,
+    labeled_volume_mmap_path,
+    lab_vol_shape,
     use_edt,
     use_anisotropic,
     enforce_containment,
@@ -987,11 +569,10 @@ def _process_single_label(
     w_L,
     w_H_base,
     tol,
+    max_distance,
     decimate_every,
     min_edge_length,
     num_features,
-    initial_connectivity,
-    pca_radius,
 ):
     """
     Worker function to process a single connected component label.
@@ -1000,8 +581,10 @@ def _process_single_label(
     ----------
     label_id : int
         ID of current label
-    labeled_volume : np.ndarray
-        Segmentation labelled with scipy's label.
+    labeled_volume_mmap_path : path
+        Path to memmap of labelled volume.
+    lab_vol_shape : tuple
+        Shape of labeled volume.
     use_edt : bool
         Enables boundary tracking potential constraints using Euclidean Distance Transforms.
     use_anisotropic : bool
@@ -1021,6 +604,8 @@ def _process_single_label(
     tol : float
         Convergence tolerance limit evaluated against mean vertex displacement.
         This should be the equivalent of gamma in Damseh 2021 (not sure).
+    max_distance : float
+        Maximum distance to consider when making the sparse adjacency matrix.
     decimate_every : int
         Frequency cadence interval defining how many contraction loop steps occur before
         triggering an edge-collapse decimation execution.
@@ -1030,10 +615,6 @@ def _process_single_label(
         decimation.
     num_features : int
         Number of extracted labels.
-    initial_connectivity : 6, 18, or 26
-        Voxel connectivity used to build the initial foreground graph.
-    pca_radius : float
-        Spatial radius used for local PCA tangent estimation.
 
     Returns
     -------
@@ -1044,12 +625,16 @@ def _process_single_label(
     final_adj : scipy.sparse.csr_matrix
         The resulting graph sparse adjacency connectivity representation of shape (M, M).
     """
-    segment = labeled_volume == label_id
-    X_init = np.argwhere(segment).astype(float)
+    labeled_volume = np.memmap(
+        labeled_volume_mmap_path, dtype=np.int32, mode='r', shape=lab_vol_shape
+    )
+    X_init = np.argwhere(labeled_volume == label_id).astype(np.int16)
+    tree = KDTree(X_init)
 
     # Skip small noise components
     if len(X_init) < 3:
-        adj_sparse = _build_initial_adjacency(X_init, initial_connectivity)
+        adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
+
         return label_id, X_init, adj_sparse
 
     print(
@@ -1057,13 +642,13 @@ def _process_single_label(
     )
 
     print('Computing proximity network coordinates...')
-    adj_sparse = _build_initial_adjacency(X_init, initial_connectivity)
+    adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
 
     # Run contraction on this label's component mask
     label_X, label_adj = laplacian_graph_contraction_edt(
         X_init,
         adj_sparse,
-        binary_segmentation=segment,
+        binary_segmentation=labeled_volume == label_id,
         use_edt=use_edt,
         use_anisotropic=use_anisotropic,
         enforce_containment=enforce_containment,
@@ -1073,13 +658,12 @@ def _process_single_label(
         tol=tol,
         decimate_every=decimate_every,
         min_edge_length=min_edge_length,
-        pca_radius=pca_radius,
     )
 
     return label_id, label_X, label_adj
 
 
-def label_and_sort(binary_mask, label_connectivity=6):
+def label_and_sort_by_size(binary_mask, label_connectivity=6):
     """
     Label connected components and re-order by size in reverse round-robin fashion.
 
@@ -1121,36 +705,46 @@ def label_and_sort(binary_mask, label_connectivity=6):
     if num_features == 0:
         return labeled_volume, 0
 
-    # Voxel count for each label (index 0 = background)
-    counts = np.bincount(labeled_volume.ravel(), minlength=num_features + 1)
+    counts = np.bincount(labeled_volume.ravel())
+    # Exclude background (index 0) and sort descending
+    sorted_labels = np.argsort(counts[1:])[::-1] + 1
 
-    # Separate label IDs (1 to num_features) into main vs. small (< 4 voxels)
-    all_labels = np.arange(1, num_features + 1)
-    main_mask = counts[1:] >= 4
-
-    main_labels = all_labels[main_mask]
-    small_labels = all_labels[~main_mask]
-
-    # Sort main labels by size descending (largest first)
-    main_counts = counts[main_labels]
-    sorted_main_indices = np.argsort(main_counts)[::-1]
-    sorted_main = main_labels[sorted_main_indices]
-
-    # Split sorted main labels into odd and even ranks
-    odds = sorted_main[0::2]
-    evens = sorted_main[1::2]
-
-    # Re-order: odds forward + evens reversed
-    interleaved_main = np.concatenate([odds, evens[::-1]])
-
-    # Final label order: custom main components followed by small components
-    final_ordered_labels = np.concatenate([interleaved_main, small_labels])
-
-    # Map old label IDs to new 1..num_features IDs
     mapping = np.zeros(num_features + 1, dtype=labeled_volume.dtype)
-    mapping[final_ordered_labels] = np.arange(1, len(final_ordered_labels) + 1)
+    mapping[sorted_labels] = np.arange(1, num_features + 1)
 
     return mapping[labeled_volume], num_features
+
+
+def coords_to_dense_3d(X, volume_shape):
+    """
+    Create and fill in a volume using coordinates of points.
+
+    Parameters
+    ----------
+    X : ndarray of shape (N, 3)
+        The 3D coordinates of the areas with content.
+    volume_shape : tuple of int (D, H, W)
+        The structural grid dimensions of the target 3D matrix.
+
+    Returns
+    -------
+    dense_volume : ndarray of shape (D, H, W)
+        A binary 3D array where 1 represents the skeleton path.
+    """
+    # 1. Initialize empty dense matrix
+    dense_volume = np.zeros(volume_shape, dtype=bool)
+
+    coords = np.rint(X).astype(np.int8)
+
+    # 2. Fix coordinates on boundaries due to numpy's round-to-even
+    for dim, bound in enumerate(volume_shape):
+        coords[:, dim][coords[:, dim] == bound] = bound - 1
+
+    # 3. Rasterize edges and nodes into the grid
+    for i in coords:
+        dense_volume[tuple(i)] = True
+
+    return dense_volume
 
 
 def laplacian_skeletonisation(
@@ -1169,8 +763,7 @@ def laplacian_skeletonisation(
     seed=42,
     separate_streams=False,
     label_connectivity=6,
-    initial_connectivity=26,
-    pca_radius=2.5,
+    max_distance=2.4999,
     n_jobs=None,
 ):
     """
@@ -1221,11 +814,8 @@ def laplacian_skeletonisation(
         Process each "independent" vessel by itself (i.e. non-connected segment)
     label_connectivity : 6, 18, 26, optional
         Connectivity profile to use to separate streams - 6, 18, or 26 edges.
-    initial_connectivity : 6, 18, 26, optional
-        Voxel connectivity used to build the initial foreground graph. Default is 26.
-    pca_radius : float, optional
-        Finite, strictly positive spatial radius used to select local PCA tangent
-        samples. Default is 2.5.
+    max_distance : float
+        Maximum distance to consider when making the sparse adjacency matrix.
     n_jobs : None, optional
         Number of parallel jobs. If not set or <=0, defaults to ~30%% of available CPU
         cores.
@@ -1244,9 +834,6 @@ def laplacian_skeletonisation(
     ValueError
         If the loaded structural NIfTI mask image is completely empty or lacks foreground elements.
     """
-    initial_connectivity = _validate_initial_connectivity(initial_connectivity)
-    pca_radius = _validate_pca_radius(pca_radius)
-
     print(f'Ingesting NIfTI image: {nifti_path}')
     _, volume_data, img = io.load_nifti_get_mask(nifti_path, is_mask=True, ndim=3)
 
@@ -1256,7 +843,7 @@ def laplacian_skeletonisation(
     # Downsample points cloud initialization limits if necessary to guard RAM bounds
     if downsample and np.any(volume_data) > 200000:
         print(f'Volume contains {np.any(volume_data)} points. Downsampling.')
-        vessel_voxels = np.argwhere(volume_data).astype(float)
+        vessel_voxels = np.argwhere(volume_data).astype(np.int16)
         rng = np.random.default_rng(seed=seed)
         idx = rng.choice(len(vessel_voxels), 150000, replace=False)
         vessel_voxels = vessel_voxels[idx]
@@ -1264,9 +851,25 @@ def laplacian_skeletonisation(
 
     # Process each component independently if separate_streams is True
     if separate_streams:
-        labeled_volume, num_features = label_and_sort(volume_data, label_connectivity)
+        labeled_volume, num_features = label_and_sort_by_size(
+            volume_data, label_connectivity
+        )
     else:
         labeled_volume, num_features = volume_data * 1, 1
+
+    temp_dir = tempfile.mkdtemp()
+    labeled_volume_mmap_path = os.path.join(temp_dir, 'labeled_vol.dat')
+    lab_vol_shape = labeled_volume.shape
+    fp = np.memmap(
+        labeled_volume_mmap_path,
+        dtype=np.int32,
+        mode='w+',
+        shape=lab_vol_shape,
+    )
+    fp[:] = labeled_volume[:]
+    fp.flush()
+    del fp
+    del labeled_volume
 
     total_cores = os.cpu_count() or 1
     if n_jobs is None or n_jobs <= 0:
@@ -1279,25 +882,31 @@ def laplacian_skeletonisation(
         f'on {total_cores} CPU cores detected.'
     )
 
-    results = ParallelPbar('Skeletonising')(n_jobs=n_workers)(
-        delayed(_process_single_label)(
-            label_id,
-            labeled_volume,
-            use_edt,
-            use_anisotropic,
-            enforce_containment,
-            beta_edt,
-            w_L,
-            w_H_base,
-            tol,
-            decimate_every,
-            min_edge_length,
-            num_features,
-            initial_connectivity=initial_connectivity,
-            pca_radius=pca_radius,
+    try:
+        results = ParallelPbar('Skeletonising')(n_jobs=n_workers)(
+            delayed(_process_single_label)(
+                label_id,
+                labeled_volume_mmap_path,
+                lab_vol_shape,
+                use_edt,
+                use_anisotropic,
+                enforce_containment,
+                beta_edt,
+                w_L,
+                w_H_base,
+                tol,
+                max_distance,
+                decimate_every,
+                min_edge_length,
+                num_features,
+            )
+            for label_id in range(1, num_features + 1)
         )
-        for label_id in range(1, num_features + 1)
-    )
+    finally:
+        print('Clean up temp files')
+        if os.path.exists(labeled_volume_mmap_path):
+            os.remove(labeled_volume_mmap_path)
+        os.rmdir(temp_dir)
 
     print('Reuniting results from parallel jobs.')
 
@@ -1307,12 +916,6 @@ def laplacian_skeletonisation(
     # Merge coordinates and sparse block-diagonal adjacency matrices across all labels
     contracted_X = np.vstack([res[1] for res in results])
     final_adj = sparse.block_diag([res[2] for res in results], format='csr')
-    component_labels = np.concatenate(
-        [
-            np.full(res[1].shape[0], res[0], dtype=int)
-            for res in results
-        ]
-    )
 
     out_path = (
         out_path
@@ -1323,14 +926,6 @@ def laplacian_skeletonisation(
     print(f'\nSaving structural centerline data matrices to: {out_path}')
     np.savez_compressed(f'{out_path}_coords.npz', contracted_X=contracted_X)
     sparse.save_npz(f'{out_path}.npz', final_adj)
-    write_graphml(
-        contracted_X,
-        final_adj,
-        component_labels=component_labels,
-        affine=img.affine,
-        volume_shape=volume_data.shape,
-        output_path=f'{out_path}.graphml',
-    )
     nifti_skel = coords_to_dense_3d(contracted_X, volume_data.shape)
 
     # If enforce containment was used, assume no loss of tracts masking with original segmentation.
