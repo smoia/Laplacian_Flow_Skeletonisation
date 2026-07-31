@@ -37,7 +37,16 @@ def get_parser():
         dest='out_path',
         type=str,
         default=None,
-        help='Path destination for the generated skeleton arrays.',
+        help='Path destination for the generated skeleton outputs.',
+    )
+    optional.add_argument(
+        '--graphml',
+        action='store_true',
+        default=argparse.SUPPRESS,
+        help=(
+            'Write the converged graph as GraphML instead of coordinate and '
+            'adjacency NPZ files.'
+        ),
     )
     optional.add_argument(
         '--use_edt',

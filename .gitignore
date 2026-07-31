@@ -142,4 +142,5 @@ AGENTS.md
 LOG.md
 
 # Local test instances
-laplskel/tests/
+laplskel/tests/*
+/tests/*

@@ -31,6 +31,7 @@ def laplacian_skeletonisation(
     label_connectivity=6,
     max_distance=2.4999,
     n_jobs=None,
+    graphml=False,
 ):
     """
     Load a NIfTI file volume image and perform geometric graph contraction skeletonisation.
@@ -85,6 +86,9 @@ def laplacian_skeletonisation(
     n_jobs : None, optional
         Number of parallel jobs. If not set or <=0, defaults to ~30%% of available CPU
         cores.
+    graphml : bool, optional
+        Write the converged graph as GraphML instead of coordinate and adjacency
+        NPZ files. The dense NIfTI skeleton is still written. Default is False.
 
     Returns
     -------
@@ -153,6 +157,9 @@ def laplacian_skeletonisation(
     # Merge coordinates and sparse block-diagonal adjacency matrices across all labels
     contracted_X = np.vstack([res[1] for res in results])
     final_adj = sparse.block_diag([res[2] for res in results], format='csr')
+    component_labels = np.concatenate(
+        [np.full(res[1].shape[0], res[0], dtype=int) for res in results]
+    )
 
     out_path = get_output_path(nifti_path, out_path)
     nifti_skel = save_skeleton(
@@ -162,6 +169,8 @@ def laplacian_skeletonisation(
         volume_data,
         img,
         enforce_containment,
+        graphml=graphml,
+        component_labels=component_labels,
     )
 
     return contracted_X, final_adj, nifti_skel
