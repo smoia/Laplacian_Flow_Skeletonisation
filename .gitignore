@@ -140,3 +140,6 @@ dmypy.json
 # Local agent context
 AGENTS.md
 LOG.md
+
+# Local test instances
+laplskel/tests/
