@@ -10,7 +10,8 @@ from .image_io import (
     load_nifti_mask,
     save_skeleton,
 )
-from .runtime import process_components, shared_labeled_volume
+from .runtime import process_components
+from .solvers import validate_solver
 
 
 def laplacian_skeletonisation(
@@ -23,8 +24,8 @@ def laplacian_skeletonisation(
     w_L=0.5,
     w_H_base=0.5,
     tol=0.05,
-    decimate_every=2,
-    min_edge_length=0.5,
+    decimate_every=1,
+    min_edge_length=0.01,
     downsample=False,
     seed=42,
     separate_streams=False,
@@ -32,6 +33,7 @@ def laplacian_skeletonisation(
     max_distance=2.4999,
     n_jobs=None,
     graphml=False,
+    solver='CG',
 ):
     """
     Load a NIfTI file volume image and perform geometric graph contraction skeletonisation.
@@ -67,11 +69,11 @@ def laplacian_skeletonisation(
         This should be the equivalent of gamma in Damseh 2021 (not sure). Default is 0.05.
     decimate_every : int, optional
         Frequency cadence interval defining how many contraction loop steps occur before
-        triggering an edge-collapse decimation execution. Default is 2.
+        triggering an edge-collapse decimation execution. Default is 1.
     min_edge_length : float, optional
         The Euclidean spatial threshold criteria below which two connected nodes undergo
         structural merging, i.e. the isotropic voxel size of the grid used for
-        decimation. Default is 0.5.
+        decimation. Default is 0.01.
     downsample : bool, optional
         Flag setting whether point arrays containing high density are uniformly downsampled
         to stay within safe RAM footprints. Default is False.
@@ -89,6 +91,8 @@ def laplacian_skeletonisation(
     graphml : bool, optional
         Write the converged graph as GraphML instead of coordinate and adjacency
         NPZ files. The dense NIfTI skeleton is still written. Default is False.
+    solver : {'LU', 'CG', 'AMGCG'}, optional
+        Linear-system solver used by the contraction loop. Default is CG.
 
     Returns
     -------
@@ -104,6 +108,7 @@ def laplacian_skeletonisation(
     ValueError
         If the loaded structural NIfTI mask image is completely empty or lacks foreground elements.
     """
+    solver = validate_solver(solver)
     print(f'Ingesting NIfTI image: {nifti_path}')
     _, volume_data, img = load_nifti_mask(nifti_path)
 
@@ -113,7 +118,7 @@ def laplacian_skeletonisation(
     # Downsample points cloud initialization limits if necessary to guard RAM bounds
     if downsample and np.any(volume_data) > 200000:
         print(f'Volume contains {np.any(volume_data)} points. Downsampling.')
-        vessel_voxels = np.argwhere(volume_data).astype(np.int16)
+        vessel_voxels = np.argwhere(volume_data).astype(np.uint16)
         rng = np.random.default_rng(seed=seed)
         idx = rng.choice(len(vessel_voxels), 150000, replace=False)
         vessel_voxels = vessel_voxels[idx]
@@ -127,27 +132,22 @@ def laplacian_skeletonisation(
     else:
         labeled_volume, num_features = volume_data * 1, 1
 
-    with shared_labeled_volume(labeled_volume) as (
-        labeled_volume_mmap_path,
-        lab_vol_shape,
-    ):
-        del labeled_volume
-        results = process_components(
-            labeled_volume_mmap_path,
-            lab_vol_shape,
-            num_features,
-            use_edt,
-            use_anisotropic,
-            enforce_containment,
-            beta_edt,
-            w_L,
-            w_H_base,
-            tol,
-            max_distance,
-            decimate_every,
-            min_edge_length,
-            n_jobs,
-        )
+    results = process_components(
+        labeled_volume,
+        num_features,
+        use_edt,
+        use_anisotropic,
+        enforce_containment,
+        beta_edt,
+        w_L,
+        w_H_base,
+        tol,
+        max_distance,
+        decimate_every,
+        min_edge_length,
+        n_jobs,
+        solver,
+    )
 
     print('Reuniting results from parallel jobs.')
 

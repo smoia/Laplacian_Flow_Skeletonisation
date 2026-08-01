@@ -4,6 +4,7 @@ import argparse
 import sys
 
 from .pipeline import laplacian_skeletonisation
+from .solvers import VALID_SOLVERS
 
 
 def get_parser():
@@ -104,14 +105,14 @@ def get_parser():
         '--decimate_every',
         dest='decimate_every',
         type=int,
-        default=2,
-        help='Decimate nodes every N steps [Default=2].',
+        default=1,
+        help='Decimate nodes every N steps [Default=1].',
     )
     optional.add_argument(
         '--dec_grid_size',
         dest='min_edge_length',
         type=float,
-        default=0.5,
+        default=0.01,
         help=(
             'The Euclidean spatial threshold criteria below which two connected nodes '
             'undergo structural merging, i.e. the isotropic voxel size of the grid used'
@@ -141,6 +142,15 @@ def get_parser():
         choices=[6, 18, 26],
         default=6,
         help='Neighborhood connectivity structure for labeling (6, 18, or 26) [Default=6].',
+    )
+    optional.add_argument(
+        '--solver',
+        choices=VALID_SOLVERS,
+        default='CG',
+        help=(
+            'Linear-system solver: LU, CG, or AMG-preconditioned CG '
+            '[Default=CG].'
+        ),
     )
     optional.add_argument(
         '--n_jobs',

@@ -4,6 +4,31 @@ import numpy as np
 from scipy import sparse
 
 
+class UnionFind:
+    """Disjoint-set data structure with path compression."""
+
+    def __init__(self, n_vertices):
+        self.parent = np.arange(n_vertices)
+
+    def find(self, vertex):
+        path = []
+        while self.parent[vertex] != vertex:
+            path.append(vertex)
+            vertex = self.parent[vertex]
+        for path_vertex in path:
+            self.parent[path_vertex] = vertex
+        return vertex
+
+    def union(self, first, second):
+        first_root = self.find(first)
+        second_root = self.find(second)
+        if first_root == second_root:
+            return False, first_root, second_root
+
+        self.parent[second_root] = first_root
+        return True, first_root, second_root
+
+
 def compute_laplacian_matrix(
     X, adjacency_matrix, use_anisotropic=True, alpha_norm=1.5, alpha_tang=0.1
 ):
@@ -53,15 +78,37 @@ def compute_laplacian_matrix(
 
     if use_anisotropic:
         # Estimate local structural tangents using local neighborhood PCA proxy
-        tangents = np.zeros_like(X)
-        for i in range(n_vertices):
-            neighbors = cols[rows == i]
-            if len(neighbors) > 1:
-                cov = np.cov(X[neighbors].T)
-                _, eigvecs = np.linalg.eigh(cov)
-                tangents[i] = eigvecs[:, -1]  # Principal directional eigenvector
-            else:
-                tangents[i] = np.array([1.0, 0.0, 0.0])
+        degrees = np.bincount(rows, minlength=n_vertices)
+        neighbor_sums = adjacency_matrix.dot(X)
+        neighbor_means = neighbor_sums / np.maximum(degrees[:, None], 1)
+        deviations = X[cols] - neighbor_means[rows]
+
+        covariance = np.zeros((n_vertices, 3, 3), dtype=X.dtype)
+        covariance_terms = (
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 1),
+            (1, 2),
+            (2, 2),
+        )
+        for row_dim, col_dim in covariance_terms:
+            values = np.bincount(
+                rows,
+                weights=deviations[:, row_dim] * deviations[:, col_dim],
+                minlength=n_vertices,
+            )
+            covariance[:, row_dim, col_dim] = values
+            if row_dim != col_dim:
+                covariance[:, col_dim, row_dim] = values
+
+        covariance /= np.maximum(degrees - 1, 1)[:, None, None]
+        _, eigenvectors = np.linalg.eigh(covariance)
+        tangents = eigenvectors[:, :, -1]
+
+        fallback_mask = degrees <= 1
+        if np.any(fallback_mask):
+            tangents[fallback_mask] = np.array([1.0, 0.0, 0.0])
 
         t_i = tangents[rows]
         dot_products = np.sum(diffs * t_i, axis=1)
@@ -82,10 +129,7 @@ def compute_laplacian_matrix(
 
     # Build diagonal degree matrix D
     degree_values = np.array(W.sum(axis=1)).flatten()
-    D = sparse.csr_matrix(
-        (degree_values, (range(n_vertices), range(n_vertices))),
-        shape=(n_vertices, n_vertices),
-    )
+    D = sparse.diags(degree_values, format='csr')
 
     return D - W
 
@@ -121,39 +165,42 @@ def edge_collapse_decimation(X, adjacency_matrix, min_edge_length):
     n_vertices = X.shape[0]
     rows, cols = adjacency_matrix.nonzero()
 
-    # Keep track of which vertices are mapped/merged to which
-    vertex_map = np.arange(n_vertices)
+    edge_mask = rows < cols
+    first_nodes = rows[edge_mask]
+    second_nodes = cols[edge_mask]
+    edge_distances = np.linalg.norm(X[first_nodes] - X[second_nodes], axis=1)
+    short_edge_mask = edge_distances < min_edge_length
 
-    for u, v in zip(rows, cols):
-        if u >= v:
-            continue  # Only check each unique undirected edge once
+    union_find = UnionFind(n_vertices)
+    coordinate_sums = X.copy()
+    node_counts = np.ones(n_vertices, dtype=int)
 
-        # Check if the edge is shorter than the allowed threshold
-        dist = np.linalg.norm(X[u] - X[v])
-        if dist < min_edge_length:
-            root_u = vertex_map[u]
-            root_v = vertex_map[v]
-            if root_u != root_v:
-                # Merge v into u: update positions to their average
-                X[root_u] = (X[root_u] + X[root_v]) / 2.0
-                vertex_map[vertex_map == root_v] = root_u
+    for first, second in zip(
+        first_nodes[short_edge_mask], second_nodes[short_edge_mask]
+    ):
+        merged, first_root, second_root = union_find.union(first, second)
+        if merged:
+            coordinate_sums[first_root] += coordinate_sums[second_root]
+            node_counts[first_root] += node_counts[second_root]
 
-    # Remap unique remaining vertices
-    unique_verts, inverse_indices = np.unique(vertex_map, return_inverse=True)
-    new_X = X[unique_verts]
+    final_roots = np.array(
+        [union_find.find(vertex) for vertex in range(n_vertices)]
+    )
+    unique_roots, inverse_indices = np.unique(final_roots, return_inverse=True)
+    new_X = coordinate_sums[unique_roots] / node_counts[unique_roots][:, None]
 
-    # Rebuild the simplified adjacency matrix
+    # Rebuild the simplified adjacency matrix using remapped indices
     new_rows = inverse_indices[rows]
     new_cols = inverse_indices[cols]
 
-    # Remove self-loops and duplicates
+    # Remove self-loops
     valid_mask = new_rows != new_cols
     new_rows = new_rows[valid_mask]
     new_cols = new_cols[valid_mask]
 
     new_data = np.ones(len(new_rows), dtype=bool)
     new_adj = sparse.csr_matrix(
-        (new_data, (new_rows, new_cols)), shape=(len(unique_verts), len(unique_verts))
+        (new_data, (new_rows, new_cols)), shape=(len(unique_roots), len(unique_roots))
     )
 
     return new_X, new_adj

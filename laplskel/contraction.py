@@ -4,7 +4,7 @@ import numpy as np
 from scipy import ndimage, sparse
 
 from .graph import compute_laplacian_matrix, edge_collapse_decimation
-from .solvers import solve_cg, solve_lu
+from .solvers import solve_amgcg, solve_cg, solve_lu, validate_solver
 
 
 def laplacian_graph_contraction_edt(
@@ -20,8 +20,8 @@ def laplacian_graph_contraction_edt(
     delta=0.5,
     max_iter=2000,
     tol=0.05,
-    decimate_every=2,
-    min_edge_length=0.5,
+    decimate_every=1,
+    min_edge_length=0.01,
     alpha_norm=1.5,
     alpha_tang=0.1,
     solver='CG',
@@ -66,19 +66,20 @@ def laplacian_graph_contraction_edt(
         Convergence tolerance limit evaluated against mean vertex displacement. Default is 1e-3.
     decimate_every : int, optional
         Frequency cadence interval defining how many contraction loop steps occur before triggering
-        an edge-collapse decimation execution. Default is 2.
+        an edge-collapse decimation execution. Default is 1.
     min_edge_length : float, optional
         The Euclidean spatial threshold criteria below which two connected nodes undergo structural merging.
-        Default is 0.5.
+        Default is 0.01.
     alpha_norm : float, optional
         The normal/cross-sectional penalty parameter used during anisotropic calculation phases.
         Default is 1.5.
     alpha_tang : float, optional
         The tangential/longitudinal orientation penalty parameter used during anisotropic calculation phases.
         Default is 0.1.
-    solver : ['LU', 'CG'], string, optional
+    solver : ['LU', 'CG', 'AMGCG'], string, optional
         The solver to use to solve the linear system Ax = b. LU uses SuperLU, a direct
-        solver, CG uses Conjugate Gradient (iterative solver), better for memory on big data.
+        solver, CG uses Conjugate Gradient, and AMGCG uses an algebraic multigrid
+        preconditioner before running CG. Default is CG.
 
     Returns
     -------
@@ -89,6 +90,7 @@ def laplacian_graph_contraction_edt(
     """
     X = X_init.copy().astype(float)
     adj = adj_init.copy()
+    active_solver = validate_solver(solver)
 
     # Conditional 3D EDT & Hard-Voxel Constraint Lookup Precomputation
     edt_volume = None
@@ -141,10 +143,10 @@ def laplacian_graph_contraction_edt(
         max_pull = ''
 
         if use_edt:
-            ix = np.clip(np.round(X[:, 0]).astype(int), 0, vol_shape[0] - 1)
-            iy = np.clip(np.round(X[:, 1]).astype(int), 0, vol_shape[1] - 1)
-            iz = np.clip(np.round(X[:, 2]).astype(int), 0, vol_shape[2] - 1)
-            node_distances = edt_volume[ix, iy, iz]
+            node_distances = ndimage.map_coordinates(
+                edt_volume, X.T, order=1, mode='nearest'
+            )
+            node_distances = np.maximum(node_distances, 0.0)
             w_H_per_node = w_H_base * np.exp(beta_edt / (node_distances + delta))
             W_H_sq = sparse.diags(w_H_per_node**2, format='csr')
             max_pull = f' - Max EDT w_H Pull: {np.max(w_H_per_node):.4f}'
@@ -152,24 +154,32 @@ def laplacian_graph_contraction_edt(
             W_H_sq = sparse.eye(n_vertices, format='csr') * (w_H_base**2)
 
         # 3. Solve Implicit Update System equations
-        if solver == 'LU':
-            A = (w_L**2) * L_squared + W_H_sq
-            B = W_H_sq.dot(X)
+        A = (w_L**2) * L_squared + W_H_sq
+        B = W_H_sq.dot(X)
+
+        if active_solver == 'LU':
             X_next = solve_lu(A, B)
-        elif solver == 'CG':
-            A = (w_L**2) * L_squared + W_H_sq
-            B = W_H_sq.dot(X)
+        elif active_solver == 'CG':
             X_next = solve_cg(A, B, X)
+        else:
+            X_next, used_amg = solve_amgcg(A, B, X)
+            if not used_amg:
+                active_solver = 'CG'
 
         # 4. Explicit Hard-Voxel Containment Constraint Projection
         if enforce_containment:
-            # Re-discretize positions to evaluate mask containment state
-            ix_next = np.clip(np.round(X_next[:, 0]).astype(int), 0, vol_shape[0] - 1)
-            iy_next = np.clip(np.round(X_next[:, 1]).astype(int), 0, vol_shape[1] - 1)
-            iz_next = np.clip(np.round(X_next[:, 2]).astype(int), 0, vol_shape[2] - 1)
+            # Record out-of-bounds positions before clipping for safe array lookup.
+            voxel_positions = np.rint(X_next).astype(np.intp)
+            volume_bounds = np.asarray(vol_shape)
+            out_of_bounds = np.any(
+                (voxel_positions < 0) | (voxel_positions >= volume_bounds), axis=1
+            )
+            lookup_positions = np.clip(voxel_positions, 0, volume_bounds - 1)
+            ix_next, iy_next, iz_next = lookup_positions.T
 
-            # Find points that fell outside the vessel grid (mask == 0)
-            escaped_mask = binary_segmentation[ix_next, iy_next, iz_next] == 0
+            escaped_mask = out_of_bounds | (
+                binary_segmentation[ix_next, iy_next, iz_next] == 0
+            )
             escaped_count = np.sum(escaped_mask)
 
             if escaped_count > 0:
