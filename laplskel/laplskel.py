@@ -869,7 +869,7 @@ def coords_to_dense_3d(X, volume_shape):
     # 1. Initialize empty dense matrix
     dense_volume = np.zeros(volume_shape, dtype=bool)
 
-    coords = np.rint(X).astype(np.int8)
+    coords = np.rint(X).astype(np.int64)
 
     # 2. Fix coordinates on boundaries due to numpy's round-to-even
     for dim, bound in enumerate(volume_shape):
