@@ -5,6 +5,7 @@ import os
 import sys
 
 import numpy as np
+import torch
 from joblib import delayed
 from nigsp import io
 from scipy import ndimage, sparse
@@ -402,6 +403,65 @@ def edge_collapse_decimation(X, adjacency_matrix, min_edge_length):
     return new_X, new_adj
 
 
+def solve_cg_pytorch(
+    L_csr, B, x0, w_L, w_H_vec, device_id=None, rtol=1e-4, maxiter=500
+):
+    """
+    Solves Ax = B using Conjugate Gradient on CUDA via PyTorch,
+    evaluating A @ v = w_L^2 * L @ (L @ v) + W_H^2 * v iteratively
+    without explicitly building L^2.
+    """
+    # Select target GPU (fallback to standard CUDA or CPU if unavailable)
+    if device_id is not None and torch.cuda.is_available():
+        device = torch.device(f'cuda:{device_id % torch.cuda.device_count()}')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    # Convert SciPy CSR arrays to PyTorch CUDA Sparse CSR Tensors
+    L_torch = torch.sparse_csr_tensor(
+        torch.from_numpy(L_csr.indptr).to(device=device, dtype=torch.int32),
+        torch.from_numpy(L_csr.indices).to(device=device, dtype=torch.int32),
+        torch.from_numpy(L_csr.data).to(device=device, dtype=torch.float64),
+        size=L_csr.shape,
+    )
+
+    B_t = torch.from_numpy(B).to(device=device, dtype=torch.float64)
+    X_t = torch.from_numpy(x0).to(device=device, dtype=torch.float64)
+    w_h_sq = torch.from_numpy(w_H_vec**2).to(device=device, dtype=torch.float64)
+    w_L_sq = w_L**2
+
+    # Vectorized MatVec evaluation for all 3 dimensions (X, Y, Z) simultaneously
+    # B_t and X_t shape: (N, 3)
+    def A_mv(v):
+        # Sparse-Dense matrix multiplication: L @ (L @ v)
+        Lv = torch.matmul(L_torch, v)
+        LLv = torch.matmul(L_torch, Lv)
+        return w_L_sq * LLv + w_h_sq[:, None] * v
+
+    # Batch Conjugate Gradient across (X, Y, Z) spatial coordinates
+    r = B_t - A_mv(X_t)
+    p = r.clone()
+    rsold = torch.sum(r * r, dim=0)
+
+    for _ in range(maxiter):
+        Ap = A_mv(p)
+        alpha = rsold / torch.sum(p * Ap, dim=0)
+        X_t += alpha * p
+        r -= alpha * Ap
+        rsnew = torch.sum(r * r, dim=0)
+
+        # Stop early if maximum residual across all 3 spatial dims satisfies tolerance
+        if torch.max(torch.sqrt(rsnew)) < rtol:
+            break
+
+        p = r + (rsnew / rsold) * p
+        rsold = rsnew
+
+    return X_t.cpu().numpy()
+
+
 def laplacian_graph_contraction(
     X_init,
     adj_init,
@@ -420,6 +480,7 @@ def laplacian_graph_contraction(
     alpha_norm=1.5,
     alpha_tang=0.1,
     solver='CG',
+    device_id=None,
 ):
     """
     Carry out Laplacian Flow Dynamics.
@@ -562,6 +623,7 @@ def laplacian_graph_contraction(
         check_solver = True
 
         if solver == 'AMGCG' and check_solver:
+            check_solver = False
             # Prepare fallback to CG if AMGCG cannot run due to too many voxels.
             try:
                 import pyamg
@@ -592,6 +654,19 @@ def laplacian_graph_contraction(
             X_next = np.zeros_like(X)
             for dim in range(3):
                 X_next[:, dim] = spsolve(A, B[:, dim])
+
+        elif solver == 'GPUCG':
+            # Run GPU acceleration without building L^2 matrix
+            X_next = solve_cg_pytorch(
+                L_csr=L,
+                B=w_H_per_node[:, None] ** 2 * X,
+                x0=X,
+                w_L=w_L,
+                w_H_vec=w_H_per_node,
+                device_id=device_id,
+                rtol=1e-4,
+                maxiter=500,
+            )
 
         elif solver == 'AMGCG':
             ml = pyamg.ruge_stuben_solver(A)
@@ -772,6 +847,8 @@ def _process_single_label(
     print('Computing proximity network coordinates...')
     adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
 
+    gpu_id = label_id % torch.cuda.device_count() if torch.cuda.is_available() else None
+
     # Run contraction on this label's component mask
     label_X_local, label_adj = laplacian_graph_contraction(
         X_init_local,
@@ -787,6 +864,7 @@ def _process_single_label(
         decimate_every=decimate_every,
         min_edge_length=min_edge_length,
         solver=solver,
+        device_id=gpu_id,
     )
 
     label_X_global = label_X_local + np.array(offset_origin, dtype=np.float32)
