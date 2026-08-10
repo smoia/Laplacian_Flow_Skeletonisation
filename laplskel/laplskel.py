@@ -943,12 +943,11 @@ def label_and_sort_by_size(binary_mask, label_connectivity=6):
     return mapping[labeled_volume], num_features, sorted_sizes
 
 
-def _split_label_into_slabs(cropped_label, offset_origin, n_slabs=None):
+def _split_label_into_slabs(cropped_label, offset_origin, label_size, n_slabs=None):
     """
     Split a large cropped label along its longest dimension into overlapping slabs.
     Overlap is set to 10% of the slab length.
     """
-    label_size = cropped_label.sum()
     if n_slabs is None or n_slabs <= 0:
         n_slabs = int(np.ceil(label_size / 500000))
     n_slabs = max(1, n_slabs)
@@ -1236,7 +1235,7 @@ def laplacian_skeletonisation(
         else:
             # Labels >= 700,000 are split into overlapping slabs along longest dim
             slabs = _split_label_into_slabs(
-                cropped_label, offset_origin, n_slabs=n_slabs
+                cropped_label, offset_origin, label_size, n_slabs=n_slabs
             )
             for slab_mask, slab_offset, slab_info in slabs:
                 tasks.append(
