@@ -5,7 +5,6 @@ import os
 import sys
 
 import numpy as np
-import torch
 from joblib import delayed
 from nigsp import io
 from scipy import ndimage, sparse
@@ -407,10 +406,13 @@ def solve_cg_pytorch(
     L_csr, B, x0, w_L, w_H_vec, device_id=None, rtol=1e-4, maxiter=500
 ):
     """
-    Solves Ax = B using Conjugate Gradient on CUDA via PyTorch,
-    evaluating A @ v = w_L^2 * L @ (L @ v) + W_H^2 * v iteratively
+    Solve Ax = B using Conjugate Gradient on CUDA via PyTorch.
+
+    Evaluates A @ v = w_L^2 * L @ (L @ v) + W_H^2 * v iteratively
     without explicitly building L^2.
     """
+    import torch
+
     # Select target GPU (fallback to standard CUDA or CPU if unavailable)
     if device_id is not None and torch.cuda.is_available():
         device = torch.device(f'cuda:{device_id % torch.cuda.device_count()}')
@@ -847,7 +849,9 @@ def _process_single_label(
     print('Computing proximity network coordinates...')
     adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
 
-    gpu_id = label_id % torch.cuda.device_count() if torch.cuda.is_available() else None
+    if solver == 'GPUGC':
+        from torch.cuda import device_count, is_available
+    gpu_id = label_id % device_count() if is_available() else None
 
     # Run contraction on this label's component mask
     label_X_local, label_adj = laplacian_graph_contraction(
