@@ -857,7 +857,10 @@ def _process_single_label(
 
     if solver == 'GPUGC':
         from torch.cuda import device_count, is_available
-    gpu_id = label_id % device_count() if is_available() else None
+
+        gpu_id = label_id % device_count() if is_available() else None
+    else:
+        gpu_id = None
 
     # Run contraction on this label's component mask
     label_X_local, label_adj = laplacian_graph_contraction(
