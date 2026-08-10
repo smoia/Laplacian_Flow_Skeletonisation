@@ -183,6 +183,12 @@ def _get_parser():
         ),
     )
     optional.add_argument(
+        '--n_slabs',
+        type=int,
+        default=None,
+        help='Fixed number of slabs N to divide large labels (>= 700k voxels) into.',
+    )
+    optional.add_argument(
         '--n_jobs',
         type=int,
         default=None,
@@ -924,12 +930,96 @@ def label_and_sort_by_size(binary_mask, label_connectivity=6):
         index=np.arange(1, num_features + 1, dtype=np.int32),
     )
     # Sort descending
-    sorted_labels = np.argsort(sizes)[::-1] + 1
+    sorted_indices = np.argsort(sizes)[::-1]
+    sorted_labels = sorted_indices + 1
+    sorted_sizes = sizes[sorted_indices]
 
     mapping = np.zeros(num_features + 1, dtype=labeled_volume.dtype)
     mapping[sorted_labels] = np.arange(1, num_features + 1, dtype=labeled_volume.dtype)
 
-    return mapping[labeled_volume], num_features
+    return mapping[labeled_volume], num_features, sorted_sizes
+
+
+def _split_label_into_slabs(cropped_label, offset_origin, n_slabs=None):
+    """
+    Split a large cropped label along its longest dimension into overlapping slabs.
+    Overlap is set to 10% of the slab length.
+    """
+    label_size = cropped_label.sum()
+    if n_slabs is None or n_slabs <= 0:
+        n_slabs = int(np.ceil(label_size / 500000))
+    n_slabs = max(1, n_slabs)
+
+    shape = cropped_label.shape
+    longest_dim = np.argmax(shape)
+    axis_length = shape[longest_dim]
+
+    if n_slabs == 1 or axis_length < n_slabs:
+        return [(cropped_label, offset_origin, None)]
+
+    base_slab_len = axis_length / n_slabs
+    overlap_len = base_slab_len * 0.10
+
+    slabs = []
+    for i in range(n_slabs):
+        start = max(0.0, i * base_slab_len - overlap_len)
+        end = min(float(axis_length), (i + 1) * base_slab_len + overlap_len)
+
+        start_idx = int(np.floor(start))
+        end_idx = int(np.ceil(end))
+
+        # Define slab slice along the longest dimension
+        slab_slices = [slice(None)] * 3
+        slab_slices[longest_dim] = slice(start_idx, end_idx)
+
+        slab_mask = cropped_label[tuple(slab_slices)]
+        if not np.any(slab_mask):
+            continue
+
+        # Adjust origin offset for the slab
+        slab_offset = list(offset_origin)
+        slab_offset[longest_dim] += start_idx
+
+        # Calculate coordinate bounds relative to the slab's internal local space
+        # representing the 50% overlap trim zones to drop during merge
+        cut_low = (base_slab_len * 0.05) if i > 0 else -np.inf
+        cut_high = (end - start - base_slab_len * 0.05) if i < n_slabs - 1 else np.inf
+
+        slab_info = {
+            'dim': longest_dim,
+            'cut_low': cut_low,
+            'cut_high': cut_high,
+        }
+
+        slabs.append((slab_mask, tuple(slab_offset), slab_info))
+
+    return slabs
+
+
+def _trim_slab_overlap(label_X_global, label_adj, slab_info):
+    """
+    Remove half of the overlap region from processed slab coordinates and adjacency matrices.
+    """
+    if slab_info is None:
+        return label_X_global, label_adj
+
+    dim = slab_info['dim']
+    cut_low = slab_info['cut_low']
+    cut_high = slab_info['cut_high']
+
+    # Local coordinates within the slab
+    local_coords = (
+        label_X_global[:, dim] - label_X_global[:, dim].min()
+        if len(label_X_global) > 0
+        else []
+    )
+
+    keep_mask = (local_coords >= cut_low) & (local_coords <= cut_high)
+
+    trimmed_X = label_X_global[keep_mask]
+    trimmed_adj = label_adj[keep_mask][:, keep_mask]
+
+    return trimmed_X, trimmed_adj
 
 
 def coords_to_dense_3d(X, volume_shape):
@@ -981,6 +1071,7 @@ def laplacian_skeletonisation(
     separate_streams=False,
     label_connectivity=6,
     solver='CG',
+    n_slabs=None,
     max_distance=2.4999,
     n_jobs=None,
 ):
@@ -1075,11 +1166,14 @@ def laplacian_skeletonisation(
 
     # Process each component independently if separate_streams is True
     if separate_streams:
-        labeled_volume, num_features = label_and_sort_by_size(
+        labeled_volume, num_features, label_sizes = label_and_sort_by_size(
             volume_data, label_connectivity
         )
     else:
         labeled_volume, num_features = volume_data * 1, 1
+        label_sizes = (
+            np.array([np.sum(volume_data)]) if np.any(volume_data) else np.array([0])
+        )
 
     total_cores = os.cpu_count() or 1
     if n_jobs is None or n_jobs <= 0:
@@ -1095,6 +1189,8 @@ def laplacian_skeletonisation(
     slices_list = ndimage.find_objects(labeled_volume)
 
     tasks = []
+    task_metadata = []  # Keep track of slab metadata for post-processing merge
+
     for label_id in range(1, num_features + 1):
         bbox_slice = slices_list[label_id - 1]
 
@@ -1103,6 +1199,7 @@ def laplacian_skeletonisation(
 
         # Extract cropped boolean mask for ONLY this label
         cropped_label = labeled_volume[bbox_slice] == label_id
+        label_size = label_sizes[label_id - 1]
 
         # Offset origin (min_x, min_y, min_z) used to map back to original volume
         offset_origin = (
@@ -1111,38 +1208,77 @@ def laplacian_skeletonisation(
             bbox_slice[2].start,
         )
 
-        tasks.append(
-            delayed(_process_single_label)(
-                label_id,
-                cropped_label,
-                offset_origin,
-                use_edt,
-                use_anisotropic,
-                enforce_containment,
-                beta_edt,
-                w_L,
-                w_H_base,
-                tol,
-                max_distance,
-                decimate_every,
-                min_edge_length,
-                num_features,
-                solver,
+        # Labels < 700,000 are processed directly
+        if label_size < 700000:
+            tasks.append(
+                delayed(_process_single_label)(
+                    label_id,
+                    cropped_label,
+                    offset_origin,
+                    use_edt,
+                    use_anisotropic,
+                    enforce_containment,
+                    beta_edt,
+                    w_L,
+                    w_H_base,
+                    tol,
+                    max_distance,
+                    decimate_every,
+                    min_edge_length,
+                    num_features,
+                    solver,
+                )
             )
-        )
+            task_metadata.append({'label_id': label_id, 'slab_info': None})
+        else:
+            # Labels >= 700,000 are split into overlapping slabs along longest dim
+            slabs = _split_label_into_slabs(
+                cropped_label, offset_origin, n_slabs=n_slabs
+            )
+            for slab_mask, slab_offset, slab_info in slabs:
+                tasks.append(
+                    delayed(_process_single_label)(
+                        label_id,
+                        slab_mask,
+                        slab_offset,
+                        use_edt,
+                        use_anisotropic,
+                        enforce_containment,
+                        beta_edt,
+                        w_L,
+                        w_H_base,
+                        tol,
+                        max_distance,
+                        decimate_every,
+                        min_edge_length,
+                        num_features,
+                        solver,
+                    )
+                )
+                task_metadata.append({'label_id': label_id, 'slab_info': slab_info})
 
-    # 2. Run workers in parallel
-    results = ParallelPbar('Skeletonising')(n_jobs=n_workers, batch_size=1)(tasks)
+    # Run workers in parallel
+    raw_results = ParallelPbar('Skeletonising')(n_jobs=n_workers, batch_size=1)(tasks)
 
-    print('Reuniting results from parallel jobs.')
+    print('Reuniting and trimming overlapping slab results from parallel jobs.')
 
-    if not results:
+    if not raw_results:
         raise ValueError('No valid components found for contraction.')
 
     # Merge coordinates and sparse block-diagonal adjacency matrices across all labels
-    contracted_X = np.vstack([res[1] for res in results])
-    final_adj = sparse.block_diag([res[2] for res in results], format='csr')
+    processed_X = []
+    processed_adj = []
 
+    for res, meta in zip(raw_results, task_metadata):
+        _, X_global, adj = res
+        trimmed_X, trimmed_adj = _trim_slab_overlap(X_global, adj, meta['slab_info'])
+        if len(trimmed_X) > 0:
+            processed_X.append(trimmed_X)
+            processed_adj.append(trimmed_adj)
+
+    # Merge coordinates and sparse block-diagonal adjacency matrices across all items
+    contracted_X = np.vstack(processed_X)
+    final_adj = sparse.block_diag(processed_adj, format='csr')
     out_path = (
         out_path
         if out_path
