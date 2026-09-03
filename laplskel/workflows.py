@@ -7,7 +7,7 @@ from nigsp import io
 from scipy import sparse
 
 from .parallelisation import process_components
-from .utils import coords_to_dense_3d, label_and_sort_by_size
+from .utils import coords_to_dense_3d, label_and_sort_by_size, write_graphml
 
 
 def laplacian_skeletonisation(
@@ -19,6 +19,7 @@ def laplacian_skeletonisation(
     beta_edt=1.0,
     w_L=0.5,
     w_H_base=0.5,
+    w_H_medial=1.0,
     tol=0.05,
     decimate_every=1,
     min_edge_length=0.01,
@@ -26,9 +27,11 @@ def laplacian_skeletonisation(
     seed=42,
     separate_streams=False,
     label_connectivity=6,
+    init_graph_adj=26,
+    local_pca_hops=1,
     solver='CG',
-    max_distance=2.4999,
     n_jobs=None,
+    graphml=False,
 ):
     """
     Load a NIfTI file volume image and perform geometric graph contraction skeletonisation.
@@ -59,6 +62,11 @@ def laplacian_skeletonisation(
     w_H_base : float, optional
         Baseline structural node anchor positional persistence value metric.
         This should be equivalent to beta in Damseh 2021. Default is 0.5.
+    w_H_medial : float, optional
+        Multiplicative retention boost applied to nodes at or around inscribed-sphere
+        centres, raised to the power of each node's medialness score. Holding medial
+        nodes in place tightens the centreline onto the medial axis. A value of 1.0
+        disables the boost. Default is 1.0.
     tol : float, optional
         Convergence tolerance limit evaluated against mean vertex displacement.
         This should be the equivalent of gamma in Damseh 2021 (not sure). Default is 0.05.
@@ -67,8 +75,8 @@ def laplacian_skeletonisation(
         triggering an edge-collapse decimation execution. Default is 1.
     min_edge_length : float, optional
         The Euclidean spatial threshold criteria below which two connected nodes undergo
-        structural merging, i.e. the isotropic voxel size of the grid used for
-        decimation. Default is 0.01.
+        structural merging, expressed as a fraction of the isotropic voxel length.
+        Default is 0.01.
     downsample : bool, optional
         Flag setting whether point arrays containing high density are uniformly downsampled
         to stay within safe RAM footprints. Default is False.
@@ -78,17 +86,24 @@ def laplacian_skeletonisation(
         Process each "independent" vessel by itself (i.e. non-connected segment)
     label_connectivity : 6, 18, 26, optional
         Connectivity profile to use to separate streams - 6, 18, or 26 edges.
+    init_graph_adj : {6, 18, 26}, int, optional
+        Voxel-neighborhood connectivity used to construct the initial graph.
+        Default is 26.
+    local_pca_hops : int, optional
+        Number of graph hops included in each node's neighborhood when estimating
+        local tangent directions. Default is 1.
     solver : ['LU', 'CG', 'AMGCG'], string, optional
         The solver to use to solve the linear system Ax = b. LU uses SuperLU, a direct
         solver, CG uses Conjugate Gradient (iterative solver), better for memory on big
         data, AMGCG constructs an Algebraic Multigrid (AMG) preconditioner before
         running CG, which makes it far faster, but may require a tad more memory.
         Default is CG.
-    max_distance : float
-        Maximum distance to consider when making the sparse adjacency matrix.
     n_jobs : None, optional
         Number of parallel jobs. If not set or <=0, defaults to ~30%% of available CPU
         cores.
+    graphml : bool, optional
+        Write the converged graph as GraphML instead of coordinate and adjacency
+        NPZ files. The dense NIfTI skeleton is still written. Default is False.
 
     Returns
     -------
@@ -136,8 +151,10 @@ def laplacian_skeletonisation(
         beta_edt,
         w_L,
         w_H_base,
+        w_H_medial,
         tol,
-        max_distance,
+        init_graph_adj,
+        local_pca_hops,
         decimate_every,
         min_edge_length,
         n_jobs,
@@ -160,8 +177,21 @@ def laplacian_skeletonisation(
     )
 
     print(f'\nSaving structural centerline data matrices to: {out_path}')
-    np.savez_compressed(f'{out_path}_coords.npz', contracted_X=contracted_X)
-    sparse.save_npz(f'{out_path}.npz', final_adj)
+    if graphml:
+        component_labels = np.concatenate(
+            [np.full(res[1].shape[0], res[0], dtype=int) for res in results]
+        )
+        write_graphml(
+            contracted_X,
+            final_adj,
+            component_labels=component_labels,
+            affine=img.affine,
+            volume_shape=volume_data.shape,
+            output_path=f'{out_path}.graphml',
+        )
+    else:
+        np.savez_compressed(f'{out_path}_coords.npz', contracted_X=contracted_X)
+        sparse.save_npz(f'{out_path}.npz', final_adj)
     nifti_skel = coords_to_dense_3d(contracted_X, volume_data.shape)
 
     # If enforce containment was used, assume no loss of tracts masking with original segmentation.

@@ -5,7 +5,12 @@ from scipy import sparse
 
 
 def compute_laplacian_matrix(
-    X, adjacency_matrix, use_anisotropic=True, alpha_norm=1.5, alpha_tang=0.1
+    X,
+    adjacency_matrix,
+    use_anisotropic=True,
+    alpha_norm=1.5,
+    alpha_tang=0.1,
+    local_pca_hops=1,
 ):
     """
     Compute the Graph Laplacian Matrix L = D - W.
@@ -34,6 +39,9 @@ def compute_laplacian_matrix(
     alpha_tang : float, optional
         The scaling coefficient penalty assigned to tangential (longitudinal direction)
         displacement components when `use_anisotropic` is active. Default is 0.1.
+    local_pca_hops : int, optional
+        Number of graph hops included in each vertex's local neighborhood when
+        estimating anisotropic tangent directions. Default is 1.
 
     Returns
     -------
@@ -41,6 +49,13 @@ def compute_laplacian_matrix(
         The calculated sparse Graph Laplacian Matrix of shape (N, N) governed
         by the equation L = D - W.
     """
+    if (
+        isinstance(local_pca_hops, (bool, np.bool_))
+        or not isinstance(local_pca_hops, (int, np.integer))
+        or local_pca_hops <= 0
+    ):
+        raise ValueError('local_pca_hops must be a positive integer.')
+
     n_vertices = X.shape[0]
 
     # Get row and col indices from the sparse adjacency matrix
@@ -52,18 +67,23 @@ def compute_laplacian_matrix(
     distances = np.maximum(distances, 1e-6)  # Prevent division by zero
 
     if use_anisotropic:
+        pca_adjacency = _compute_n_hop_adjacency(
+            adjacency_matrix, local_pca_hops
+        )
+        pca_rows, pca_cols = pca_adjacency.nonzero()
+
         # Estimate local structural tangents using local neighborhood PCA proxy
-        degrees = np.bincount(rows, minlength=n_vertices)
+        degrees = np.bincount(pca_rows, minlength=n_vertices)
 
         # Compute neighbor means for all vertices via sparse matrix multiplication
         # shape: (N, 3)
-        neighbor_sums = adjacency_matrix.dot(X)
+        neighbor_sums = pca_adjacency.dot(X)
         safe_degrees = np.maximum(degrees[:, None], 1)
         neighbor_means = neighbor_sums / safe_degrees
 
         # Compute neighbor deviations from neighbor means per edge
         # shape: (E, 3)
-        devs = X[cols] - neighbor_means[rows]
+        devs = X[pca_cols] - neighbor_means[pca_rows]
 
         # Assemble (N, 3, 3) covariance tensor using vectorized bincount
         cov_tensor = np.zeros((n_vertices, 3, 3), dtype=X.dtype)
@@ -75,7 +95,9 @@ def compute_laplacian_matrix(
         for r, c in pairs:
             # Aggregate outer products per vertex
             cov_val = np.bincount(
-                rows, weights=devs[:, r] * devs[:, c], minlength=n_vertices
+                pca_rows,
+                weights=devs[:, r] * devs[:, c],
+                minlength=n_vertices,
             )
             cov_tensor[:, r, c] = cov_val
             if r != c:
@@ -116,7 +138,26 @@ def compute_laplacian_matrix(
     return D - W
 
 
-def compute_sparse_adjacency_matrix(tree, max_distance=2.4999):
+def _compute_n_hop_adjacency(adjacency_matrix, hops):
+    """Return boolean connectivity to every node reachable within ``hops`` edges."""
+    adjacency = adjacency_matrix.astype(bool).tocsr()
+    adjacency.setdiag(False)
+    adjacency.eliminate_zeros()
+
+    reached = adjacency.copy()
+    frontier = adjacency
+    for _ in range(1, hops):
+        frontier = (frontier @ adjacency).astype(bool).tocsr()
+        frontier.setdiag(False)
+        frontier.eliminate_zeros()
+        reached = (reached + frontier).astype(bool).tocsr()
+
+    reached.setdiag(False)
+    reached.eliminate_zeros()
+    return reached
+
+
+def compute_sparse_adjacency_matrix(tree, init_graph_adj=26):
     """
     Compute sparse adjacency matrix.
 
@@ -124,16 +165,36 @@ def compute_sparse_adjacency_matrix(tree, max_distance=2.4999):
     ----------
     tree : scipy.spatial.KDTree
         The tree initialised from X_init
-    max_distance : float, optional
-        Max distance to consider in the tree to compute the adj matrix
+    init_graph_adj : {6, 18, 26}, int, optional
+        Voxel-neighborhood connectivity used to construct graph edges. Default is 26.
 
     Returns
     -------
     adj_sparse : scipy.sparse.csr_matrix
         Sparse adjacency matrix
     """
-    # Returns a sparse adjacency matrix directly for distances strictly within radius (0, 2.5)
-    adj_sparse = tree.sparse_distance_matrix(tree, max_distance=max_distance).tocsr()
+    connectivity_radii = {
+        6: 1.0,
+        18: np.nextafter(np.sqrt(2.0), np.inf),
+        26: np.nextafter(np.sqrt(3.0), np.inf),
+    }
+    if init_graph_adj not in connectivity_radii:
+        raise ValueError('init_graph_adj must be one of 6, 18, or 26.')
+
+    coordinates = np.asarray(tree.data)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 3:
+        raise ValueError('Initial graph coordinates must have shape (N, 3).')
+    if not np.all(np.isfinite(coordinates)) or not np.all(
+        coordinates == np.rint(coordinates)
+    ):
+        raise ValueError(
+            'Initial graph coordinates must lie on the integer voxel grid.'
+        )
+
+    # On an integer 3D voxel grid, radii 1, sqrt(2), and sqrt(3) correspond
+    # exactly to face-, face-and-edge-, and full-corner connectivity.
+    neighbor_radius = connectivity_radii[init_graph_adj]
+    adj_sparse = tree.sparse_distance_matrix(tree, neighbor_radius).tocsr()
     # Remove self-loops (distance == 0 on diagonal)
     adj_sparse.setdiag(0)
     adj_sparse.eliminate_zeros()
