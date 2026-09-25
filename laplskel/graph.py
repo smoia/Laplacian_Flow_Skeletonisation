@@ -41,7 +41,8 @@ def compute_laplacian_matrix(
         displacement components when `use_anisotropic` is active. Default is 0.1.
     local_pca_hops : int, optional
         Number of graph hops included in each vertex's local neighborhood when
-        estimating anisotropic tangent directions. Default is 1.
+        estimating anisotropic tangent directions at nodes with at least two
+        immediate neighbors. Degree-one nodes use their incident edge. Default is 1.
 
     Returns
     -------
@@ -110,10 +111,19 @@ def compute_laplacian_matrix(
         eigvals, eigvecs = np.linalg.eigh(cov_tensor)
         tangents = eigvecs[:, :, -1]
 
-        # Fallback for isolated vertices/single neighbors: default to [1, 0, 0]
-        fallback_mask = degrees <= 1
-        if np.any(fallback_mask):
-            tangents[fallback_mask] = np.array([1.0, 0.0, 0.0])
+        # A terminal node's immediate edge determines its tangent, regardless of
+        # how many vertices the wider PCA neighborhood contains.
+        immediate_degrees = np.bincount(rows, minlength=n_vertices)
+        terminal_edges = immediate_degrees[rows] == 1
+        terminal_rows = rows[terminal_edges]
+        terminal_diffs = diffs[terminal_edges]
+        terminal_lengths = np.linalg.norm(terminal_diffs, axis=1)
+        tangents[immediate_degrees == 0] = 0.0
+        tangents[terminal_rows] = 0.0
+        nonzero = terminal_lengths > 0.0
+        tangents[terminal_rows[nonzero]] = (
+            terminal_diffs[nonzero] / terminal_lengths[nonzero, None]
+        )
 
         # Compute anisotropic components per edge
         t_i = tangents[rows]

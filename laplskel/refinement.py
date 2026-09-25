@@ -10,6 +10,7 @@ T6 counts components in N18 that touch a face neighbour of the deleted voxel.
 See https://www.dgtal.org/doc/2.0/moduleDigitalTopology.html.
 """
 
+import hashlib
 import heapq
 from itertools import product
 
@@ -68,9 +69,102 @@ def _is_simple(neighbourhood):
     return np.count_nonzero(touching) == 1
 
 
-def _thin_foreground(mask, guidance):
+def thin_foreground_sweep(
+    mask,
+    guidance,
+    reference_edt,
+    spacing=(1.0, 1.0, 1.0),
+    validator=None,
+    validation_batch=64,
+    protected=None,
+):
+    """Delete one frozen boundary layer using topology-safe sequential checks.
+
+    Low-EDT boundary voxels are considered first. Within one EDT band, voxels
+    farther from the current geometric guide are preferred. Newly exposed voxels
+    wait for the next call, which makes contraction able to influence every layer.
+    """
+    foreground = np.asarray(mask, dtype=bool)
+    guide = np.asarray(guidance, dtype=float)
+    edt = np.asarray(reference_edt, dtype=float)
+    spacing = np.asarray(spacing, dtype=float)
+    if foreground.ndim != 3 or edt.shape != foreground.shape:
+        raise ValueError('mask and reference_edt must be matching 3D arrays.')
+    protected = np.zeros_like(foreground) if protected is None else np.asarray(
+        protected, dtype=bool
+    )
+    if protected.shape != foreground.shape or np.any(protected & ~foreground):
+        raise ValueError('protected voxels must be contained in the working mask.')
+    if guide.ndim != 2 or guide.shape[1] != 3 or not len(guide):
+        raise ValueError('guidance must have shape (N, 3) with at least one point.')
+    if spacing.shape != (3,) or np.any(spacing <= 0) or np.any(~np.isfinite(spacing)):
+        raise ValueError('spacing must contain three positive finite values.')
+
+    boundary = foreground & ~ndimage.binary_erosion(
+        foreground, structure=_FOREGROUND, border_value=0
+    )
+    candidates = np.argwhere(boundary)
+    if not len(candidates):
+        return foreground.copy(), 0
+    guide_distance = cKDTree(guide * spacing).query(candidates * spacing)[0]
+    band_width = float(np.min(spacing))
+    edt_bands = np.floor(edt[tuple(candidates.T)] / band_width + 1e-12)
+    order = np.lexsort(
+        (
+            candidates[:, 2],
+            candidates[:, 1],
+            candidates[:, 0],
+            -guide_distance,
+            edt_bands,
+        )
+    )
+
+    if validation_batch < 1:
+        raise ValueError('validation_batch must be positive.')
+    work = np.pad(foreground, 1)
+    protected_work = np.pad(protected, 1)
+    deleted = 0
+
+    def try_delete(candidate):
+        position = tuple(candidate)
+        if not work[position] or protected_work[position]:
+            return False
+        patch = work[tuple(slice(value - 1, value + 2) for value in candidate)]
+        # Retaining the last neighbour of a tip explicitly preserves terminal stubs.
+        if np.count_nonzero(patch) <= 2 or not _is_simple(patch):
+            return False
+        work[position] = False
+        return True
+
+    checkpoint = work.copy()
+    batch = []
+    for candidate in candidates[order] + 1:
+        if try_delete(candidate):
+            batch.append(candidate)
+        if len(batch) < validation_batch:
+            continue
+        if validator is not None and not validator(work[1:-1, 1:-1, 1:-1]):
+            work = checkpoint
+        else:
+            deleted += len(batch)
+        checkpoint = work.copy()
+        batch = []
+    if batch:
+        if validator is not None and not validator(work[1:-1, 1:-1, 1:-1]):
+            work = checkpoint
+        else:
+            deleted += len(batch)
+    return work[1:-1, 1:-1, 1:-1], deleted
+
+
+def _thin_foreground(mask, guidance, protected=None):
     """Peel simple voxels from the boundary inward, retaining curve endpoints."""
     work = np.pad(np.asarray(mask, dtype=bool), 1)
+    protected_work = np.pad(
+        np.zeros_like(mask, dtype=bool) if protected is None else protected, 1
+    )
+    if protected_work.shape != work.shape or np.any(protected_work & ~work):
+        raise ValueError('protected voxels must be contained in the working mask.')
     coordinates = np.argwhere(work)
     distance = ndimage.distance_transform_edt(work)
     guide_distance = cKDTree(guidance).query(coordinates - 1)[0]
@@ -84,7 +178,7 @@ def _thin_foreground(mask, guidance):
     while queue:
         _, p = heapq.heappop(queue)
         queued.remove(p)
-        if not work[p]:
+        if not work[p] or protected_work[p]:
             continue
         patch = work[tuple(slice(v - 1, v + 2) for v in p)]
         # A curve tip may be simple but deleting it shortens a branch.
@@ -154,6 +248,113 @@ def _tunnel_graph(coordinates):
     return np.asarray(kept, dtype=int).reshape(-1, 2), tunnels
 
 
+def branch_complex_signature(coordinates, edges):
+    """Describe terminal branches, junction attachments, and independent cycles.
+
+    Degree-two sampling is removed from the description. This is deliberately
+    stricter than component and Betti-number checks: losing a terminal stub changes
+    both the endpoint count and the branch attachment signature.
+    """
+    n_vertices = len(coordinates)
+    neighbours = [set() for _ in range(n_vertices)]
+    for u, v in np.asarray(edges, dtype=int).reshape(-1, 2):
+        neighbours[int(u)].add(int(v))
+        neighbours[int(v)].add(int(u))
+    degrees = np.array([len(items) for items in neighbours], dtype=int)
+    critical = set(np.flatnonzero(degrees != 2).tolist())
+    visited = set()
+    attachments = []
+    core_edges = []
+    closed_cycles = 0
+
+    def edge_key(u, v):
+        return (min(u, v), max(u, v))
+
+    for start in sorted(critical):
+        for neighbour in sorted(neighbours[start]):
+            if edge_key(start, neighbour) in visited:
+                continue
+            visited.add(edge_key(start, neighbour))
+            previous, current = start, neighbour
+            while current not in critical:
+                onward = sorted(neighbours[current] - {previous})
+                if not onward:
+                    break
+                following = onward[0]
+                visited.add(edge_key(current, following))
+                previous, current = current, following
+            attachments.append(
+                tuple(sorted((int(degrees[start]), int(degrees[current]))))
+            )
+            core_edges.append((int(start), int(current)))
+
+    for start in range(n_vertices):
+        for neighbour in neighbours[start]:
+            if edge_key(start, neighbour) in visited:
+                continue
+            closed_cycles += 1
+            previous, current = start, neighbour
+            visited.add(edge_key(start, neighbour))
+            while current != start:
+                onward = [item for item in neighbours[current] if item != previous]
+                if not onward:
+                    break
+                following = onward[0]
+                visited.add(edge_key(current, following))
+                previous, current = current, following
+
+    if n_vertices:
+        rows = np.concatenate(
+            ([u for u, v in edges], [v for u, v in edges])
+        ) if len(edges) else np.array([], dtype=int)
+        cols = np.concatenate(
+            ([v for u, v in edges], [u for u, v in edges])
+        ) if len(edges) else np.array([], dtype=int)
+        adjacency = sparse.csr_matrix(
+            (np.ones(len(rows), dtype=bool), (rows, cols)),
+            shape=(n_vertices, n_vertices),
+        )
+        components = sparse.csgraph.connected_components(adjacency, directed=False)[0]
+    else:
+        components = 0
+    tunnels = len(edges) - n_vertices + components
+    colors = {vertex: str(int(degrees[vertex])) for vertex in critical}
+    multiplicity = {
+        (u, v): sum(
+            (start == u and end == v) or (start == v and end == u)
+            for start, end in core_edges
+        )
+        for u in critical
+        for v in critical
+    }
+    for _ in range(len(critical)):
+        colors = {
+            vertex: hashlib.sha256(
+                repr(
+                    (
+                        colors[vertex],
+                        tuple(
+                            sorted(
+                                (colors[neighbour], multiplicity[vertex, neighbour])
+                                for neighbour in critical
+                                if multiplicity[vertex, neighbour]
+                            )
+                        ),
+                    )
+                ).encode()
+            ).hexdigest()
+            for vertex in critical
+        }
+    return (
+        int(components),
+        int(tunnels),
+        tuple(sorted(degrees[degrees != 2].tolist())),
+        tuple(sorted(attachments)),
+        int(closed_cycles),
+        tuple(sorted(colors.values())),
+    )
+
+
 def _filled_box(points, mask):
     """Certify a shortcut's entire swept region lies in solid foreground.
 
@@ -221,7 +422,7 @@ def _fit_geometry(coordinates, edges, guidance, mask, medial_boost):
 
 
 def _simplify_paths(coordinates, edges, mask, tolerance):
-    """Remove degree-two vertices only, retaining all original path error samples."""
+    """Remove degree-two vertices; mask=None skips foreground shortcut checks."""
     neighbours = [set() for _ in coordinates]
     paths = {}
     for u, v in edges:
@@ -248,7 +449,7 @@ def _simplify_paths(coordinates, edges, mask, tolerance):
         samples = np.vstack((incoming, outgoing[1:]))
         if _path_error(
             samples, coordinates[u], coordinates[v]
-        ) > tolerance or not _filled_box(samples, mask):
+        ) > tolerance or (mask is not None and not _filled_box(samples, mask)):
             continue
         neighbours[u].remove(vertex)
         neighbours[v].remove(vertex)

@@ -9,6 +9,7 @@ from scipy.sparse.linalg import cg, spsolve
 from .graph import compute_laplacian_matrix
 from .medial import compute_medialness
 from .objects import UnionFind
+from .triangle_decimation import DistanceFluxSampler, triangle_collapse_decimation
 
 
 def edge_collapse_decimation(
@@ -134,6 +135,26 @@ def edge_collapse_decimation(
     return new_X, new_adj, new_medialness
 
 
+def _project_escaped_nodes(coordinates, foreground, closest_indices):
+    """Project nodes outside the rounded foreground onto its nearest voxel."""
+    voxel_positions = np.rint(coordinates).astype(np.intp)
+    volume_bounds = np.asarray(foreground.shape)
+    out_of_bounds = np.any(
+        (voxel_positions < 0) | (voxel_positions >= volume_bounds), axis=1
+    )
+    lookup_positions = np.clip(voxel_positions, 0, volume_bounds - 1)
+    ix, iy, iz = lookup_positions.T
+    escaped = out_of_bounds | (foreground[ix, iy, iz] == 0)
+    escaped_count = int(np.sum(escaped))
+    if escaped_count:
+        projected = [
+            indices[ix[escaped], iy[escaped], iz[escaped]]
+            for indices in closest_indices
+        ]
+        coordinates[escaped] = np.stack(projected, axis=1).astype(float)
+    return coordinates, escaped_count
+
+
 def laplacian_graph_contraction(
     X_init,
     adj_init,
@@ -154,6 +175,12 @@ def laplacian_graph_contraction(
     alpha_tang=0.1,
     local_pca_hops=1,
     solver='CG',
+    provisional=False,
+    decimation_mode='edge',
+    voxel_spacing=(1.0, 1.0, 1.0),
+    dev_elongation_ratio=25.0,
+    dev_edge_thresh=0.05,
+    dev_peri_ratio=1.0,
 ):
     """
     Carry out Laplacian Flow Dynamics.
@@ -176,8 +203,8 @@ def laplacian_graph_contraction(
         If True, applies directionally weighted affinity rules prioritizing cross-sectional
         radial contraction over structural longitudinal shrinkage. Default is True.
     enforce_containment : bool, optional
-        If True, applies a hard projection constraint to force nodes drifting out of the
-        foreground mask onto the closest inner boundary shell surface voxel. Default is False.
+        If True, project escaped nodes onto the nearest foreground voxel before
+        each update and again after its solve. Default is False.
     w_L : float, optional
         Contraction weight coefficient forcing nodes toward localized neighborhood geometric centers.
         Default is 0.5.
@@ -202,11 +229,11 @@ def laplacian_graph_contraction(
         Maximum vertex displacement tolerance in voxel units. Three stable steps
         without structural changes are required. Default is 0.05.
     decimate_every : int, optional
-        Frequency cadence interval defining how many contraction loop steps occur before triggering
-        an edge-collapse decimation execution. Default is 1.
+        Contraction updates between scheduled decimation passes. Default is 1
+        for direct callers; the default workflow supplies 200.
     min_edge_length : float, optional
-        The Euclidean spatial threshold criteria below which two connected nodes undergo structural merging.
-        Default is 0.01.
+        Legacy edge-mode merge threshold in voxel units. It does not control
+        short-edge merging in triangle mode. Default is 0.01.
     alpha_norm : float, optional
         The normal/cross-sectional penalty parameter used during anisotropic calculation phases.
         Default is 1.5.
@@ -215,13 +242,36 @@ def laplacian_graph_contraction(
         Default is 0.1.
     local_pca_hops : int, optional
         Number of graph hops included in each node's neighborhood when estimating
-        local tangent directions. Default is 1.
+        local tangent directions. Degree-one nodes use their incident edge.
+        Default is 1.
     solver : ['LU', 'CG', 'AMGCG'], string, optional
         The solver to use to solve the linear system Ax = b. LU uses SuperLU, a direct
         solver, CG uses Conjugate Gradient (iterative solver), better for memory on big
         data, AMGCG constructs an Algebraic Multigrid (AMG) preconditioner before
         running CG, which makes it faster, but may require a tad more memory.
         Default is CG.
+    provisional : bool, optional
+        If True, treat ``max_iter`` as an intentional bounded contraction stage and
+        do not warn when that stage ends before geometric convergence. Default is
+        False. This does not change the numerical update or convergence test.
+    decimation_mode : {'edge', 'triangle'}, optional
+        Intermediate simplification method. The legacy edge mode remains the default
+        for direct callers and the alternating workflow. The 'triangle' token now
+        runs short-edge merging, compact-cycle collapse, and neighbourhood chain
+        projection. Default is 'edge'.
+    voxel_spacing : tuple of float, optional
+        Physical voxel spacing used by triangle geometry and flux calculations.
+    dev_elongation_ratio : float, optional
+        PCA ratio at or above which degree-five neighbourhoods project to
+        chains. Cycle collapse uses a separate fixed PCA cutoff of 25.
+        Default is 25.
+    dev_edge_thresh : float, optional
+        Short-edge threshold as a fraction of minimum voxel spacing in triangle
+        mode. Default is 0.05.
+    dev_peri_ratio : float, optional
+        Multiplier of the smallest voxel-face perimeter for cycle eligibility.
+        Eligible cycles also require a PCA ratio below the fixed cutoff of 25.
+        Default is 1.0.
 
     Returns
     -------
@@ -241,6 +291,31 @@ def laplacian_graph_contraction(
         raise ValueError('solver must be CG, AMGCG, or LU.')
     if max_iter < 1 or decimate_every < 1:
         raise ValueError('max_iter and decimate_every must be positive.')
+    if decimation_mode not in ('edge', 'triangle'):
+        raise ValueError("decimation_mode must be 'edge' or 'triangle'.")
+    voxel_spacing = np.asarray(voxel_spacing, dtype=float)
+    if (
+        voxel_spacing.shape != (3,)
+        or np.any(voxel_spacing <= 0)
+        or np.any(~np.isfinite(voxel_spacing))
+    ):
+        raise ValueError('voxel_spacing must contain three positive finite values.')
+    if not np.isfinite(dev_elongation_ratio) or dev_elongation_ratio <= 1.0:
+        raise ValueError('dev_elongation_ratio must be finite and greater than 1.')
+    if decimation_mode == 'triangle' and (
+        not np.isfinite(dev_edge_thresh) or dev_edge_thresh < 0
+    ):
+        raise ValueError('dev_edge_thresh must be finite and nonnegative.')
+    if decimation_mode == 'triangle' and (
+        not np.isfinite(dev_peri_ratio) or dev_peri_ratio <= 0
+    ):
+        raise ValueError('dev_peri_ratio must be finite and positive.')
+    if decimation_mode == 'triangle' and (
+        binary_segmentation is None
+        or np.asarray(binary_segmentation).ndim != 3
+        or not np.any(binary_segmentation)
+    ):
+        raise ValueError('triangle decimation requires a nonempty 3D segmentation.')
 
     X = X_init.copy().astype(float)
     adj = adj_init.copy()
@@ -249,14 +324,13 @@ def laplacian_graph_contraction(
     edt_volume = None
     closest_vessels_indices = None
     medialness = None
+    flux_sampler = None
 
     needs_edt = use_edt or enforce_containment or w_H_medial > 1.0
 
     if needs_edt and binary_segmentation is not None:
         print('Computing 3D EDT Map and boundary projection lookup tensors...')
         edt_volume = ndimage.distance_transform_edt(binary_segmentation)
-        vol_shape = binary_segmentation.shape
-
         if enforce_containment:
             # Inverse transform tells background voxels how far they are from the foreground target mask
             _, closest_vessels_indices = ndimage.distance_transform_edt(
@@ -279,18 +353,33 @@ def laplacian_graph_contraction(
         f'Starting contraction with {X.shape[0]} nodes \n\n'
         f'Params:\n'
         f' - w_L (\u03b1)={w_L}, w_H_base (\u03b2)={w_H_base}, tol (\u03b3)={tol},\n'
-        f' -{edt_string} min_edge_length (collapse threshold)={min_edge_length}\n\n'
+        f' -{edt_string} min_edge_length (legacy edge threshold)={min_edge_length}\n\n'
         f'Options:\n'
         f' - Anisotropic={use_anisotropic}\n'
         f' - EDT={use_edt}\n'
         f' - Medial Boost={w_H_medial if medialness is not None else False}\n'
         f' - Hard Containment={enforce_containment}\n'
+        f' - Decimation mode={decimation_mode}\n'
         f' - Decimation step={decimate_every}\n'
     )
 
     stable_steps = 0
-    for i in range(max_iter):
+    converged = False
+    final_triangle_collapse = False
+    for i in range(max_iter + 1):
+        if i == max_iter and not final_triangle_collapse:
+            break
         n_vertices = X.shape[0]
+        iteration_start = X.copy()
+        preprojected = 0
+        preproject_max_displacement = 0.0
+        if enforce_containment:
+            X, preprojected = _project_escaped_nodes(
+                X, binary_segmentation, closest_vessels_indices
+            )
+            preproject_max_displacement = np.max(
+                np.linalg.norm(X - iteration_start, axis=1)
+            )
 
         # 1. Compute chosen Laplacian variant
         L = compute_laplacian_matrix(
@@ -430,58 +519,75 @@ def laplacian_graph_contraction(
 
         # 4. Explicit Hard-Voxel Containment Constraint Projection
         if enforce_containment:
-            # Record out-of-bounds positions before clipping for safe array lookup.
-            voxel_positions = np.rint(X_next).astype(np.intp)
-            volume_bounds = np.asarray(vol_shape)
-            out_of_bounds = np.any(
-                (voxel_positions < 0) | (voxel_positions >= volume_bounds), axis=1
+            X_next, escaped_count = _project_escaped_nodes(
+                X_next, binary_segmentation, closest_vessels_indices
             )
-            lookup_positions = np.clip(voxel_positions, 0, volume_bounds - 1)
-            ix_next, iy_next, iz_next = lookup_positions.T
-
-            escaped_mask = out_of_bounds | (
-                binary_segmentation[ix_next, iy_next, iz_next] == 0
-            )
-            escaped_count = np.sum(escaped_mask)
-
-            if escaped_count > 0:
-                # Extract precomputed closest coordinate index maps for escaped nodes
-                proj_x = closest_vessels_indices[0][
-                    ix_next[escaped_mask], iy_next[escaped_mask], iz_next[escaped_mask]
-                ]
-                proj_y = closest_vessels_indices[1][
-                    ix_next[escaped_mask], iy_next[escaped_mask], iz_next[escaped_mask]
-                ]
-                proj_z = closest_vessels_indices[2][
-                    ix_next[escaped_mask], iy_next[escaped_mask], iz_next[escaped_mask]
-                ]
-
-                # Project continuous coordinates onto the target boundary shell voxels
-                X_next[escaped_mask] = np.stack(
-                    [proj_x, proj_y, proj_z], axis=1
-                ).astype(float)
+            if escaped_count:
                 max_pull += f' [Projected: {escaped_count} escaped nodes]'
 
-        movements = np.linalg.norm(X_next - X, axis=1)
+        movements = np.linalg.norm(X_next - iteration_start, axis=1)
         displacement = np.mean(movements)
         max_displacement = np.max(movements)
         X = X_next
 
+        iteration_label = f'{i + 1}/{max_iter}'
+        if i == max_iter:
+            iteration_label += ' (post-collapse update)'
+        preprojection_note = (
+            f' [Pre-projected: {preprojected} escaped nodes]' if preprojected else ''
+        )
         print(
-            f'Iter {i + 1}/{max_iter} - Remaining Nodes: {X.shape[0]} - '
-            f'Mean Drift: {displacement:.5f} - Max Drift: {max_displacement:.5f}{max_pull}'
+            f'Iter {iteration_label} - Remaining Nodes: {X.shape[0]} - '
+            f'Mean Drift: {displacement:.5f} - Max Drift: {max_displacement:.5f}'
+            f'{max_pull}{preprojection_note}'
         )
 
-        small_step = max_displacement < tol and step_solved
-        if (i + 1) % decimate_every == 0 or small_step or i + 1 == max_iter:
+        small_step = (
+            max_displacement < tol
+            and preproject_max_displacement < tol
+            and step_solved
+        )
+        structural_change = False
+        if decimation_mode == 'edge' and (
+            (i + 1) % decimate_every == 0 or small_step or i + 1 == max_iter
+        ):
             X, adj, medialness = edge_collapse_decimation(
                 X, adj, min_edge_length, medialness=medialness, w_H_medial=w_H_medial
             )
-        stable_steps = stable_steps + 1 if small_step and len(X) == n_vertices else 0
+            structural_change = len(X) != n_vertices
+        elif (
+            decimation_mode == 'triangle'
+            and i < max_iter
+            and (i + 1) % decimate_every == 0
+        ):
+            if flux_sampler is None:
+                flux_sampler = DistanceFluxSampler(binary_segmentation, voxel_spacing)
+            X, adj, medialness, structural_change = triangle_collapse_decimation(
+                X,
+                adj,
+                binary_segmentation,
+                voxel_spacing,
+                elongation_ratio=dev_elongation_ratio,
+                medialness=medialness,
+                flux_sampler=flux_sampler,
+                dev_edge_thresh=dev_edge_thresh,
+                dev_peri_ratio=dev_peri_ratio,
+            )
+            if i + 1 == max_iter and structural_change:
+                final_triangle_collapse = True
+        if structural_change:
+            stable_steps = 0
+        else:
+            stable_steps = (
+                stable_steps + 1 if small_step and len(X) == n_vertices else 0
+            )
         if stable_steps >= 3:
             print('Contraction geometry stable.')
+            converged = True
             break
-    else:
+    if not converged:
+        if provisional:
+            return X, adj
         warnings.warn(
             'Contraction reached max_iter without stable geometry; these coordinates '
             'are provisional and require foreground-guided refinement.',

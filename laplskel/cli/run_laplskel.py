@@ -63,6 +63,37 @@ def _get_parser():
         ),
     )
     optional.add_argument(
+        '--dev_contra_graph',
+        action='store_true',
+        help=(
+            'Also write the contracted graph before thinning as '
+            '<output_stem>_intermediate.graphml. Ignored with --alternating.'
+        ),
+    )
+    optional.add_argument(
+        '--alternating',
+        action='store_true',
+        help=(
+            'Use the experimental fixed-schedule contraction/thinning workflow '
+            'with original-foreground EDT ridge guidance.'
+        ),
+    )
+    optional.add_argument(
+        '--alter_init_thinning',
+        action='store_true',
+        help=(
+            'With --alternating, build an initial branch reference and enable '
+            'reference preservation, critical-node movement caps and containment. '
+            'Without this flag, use default thinning rules and free graph fitting.'
+        ),
+    )
+    optional.add_argument(
+        '--contraction_steps',
+        type=_positive_integer,
+        default=5,
+        help='Maximum contraction iterations per --alternating cycle [Default=5].',
+    )
+    optional.add_argument(
         '--use_edt',
         action='store_true',
         help=(
@@ -84,8 +115,8 @@ def _get_parser():
         '--enforce_containment',
         action='store_true',
         help=(
-            'Apply a hard projection constraint to force nodes drifting out of the '
-            'foreground mask onto the closest inner boundary shell surface voxel.'
+            'Project escaped nodes to the nearest foreground voxel before each '
+            'contraction update and after its solve.'
         ),
     )
     optional.add_argument(
@@ -132,8 +163,8 @@ def _get_parser():
         '--decimate_every',
         dest='decimate_every',
         type=int,
-        default=1,
-        help='Decimate nodes every N steps [Default=1].',
+        default=200,
+        help='Run default-workflow graph decimation every N steps [Default=200].',
     )
     optional.add_argument(
         '--dec_grid_size',
@@ -141,8 +172,40 @@ def _get_parser():
         type=float,
         default=0.01,
         help=(
-            'Maximum intermediate merge-cluster diameter in voxel units. '
-            'Final branch simplification uses --merge_tolerance.'
+            'Legacy edge-decimation threshold retained for compatibility; it does '
+            'not affect default-workflow graph decimation.'
+        ),
+    )
+    optional.add_argument(
+        '--dev-elongation-ratio',
+        '--dev_elongation_ratio',
+        dest='dev_elongation_ratio',
+        type=float,
+        default=25.0,
+        help=(
+            'Developmental PCA threshold for projecting degree-five '
+            'neighbourhoods onto chains. Cycles use a fixed cutoff of 25 '
+            '[Default=25].'
+        ),
+    )
+    optional.add_argument(
+        '--dev_edge_thresh',
+        type=float,
+        default=0.05,
+        help=(
+            'Merge connected edges shorter than this fraction of the smallest '
+            'voxel spacing [Default=0.05]. Zero disables optional short-edge '
+            'merging; connected coincident nodes still merge.'
+        ),
+    )
+    optional.add_argument(
+        '--dev_peri_ratio',
+        type=float,
+        default=1.0,
+        help=(
+            'Cycle perimeter limit as a multiple of the smallest voxel-face '
+            'perimeter [Default=1.0]. Larger values admit larger cycles, which '
+            'must also have a PCA ratio below the fixed cutoff of 25.'
         ),
     )
     optional.add_argument(
@@ -171,8 +234,8 @@ def _get_parser():
         type=_positive_integer,
         default=1,
         help=(
-            'Number of graph hops used for each local tangent PCA neighborhood '
-            '[Default=1].'
+            'Graph hops used for local tangent PCA at nodes with at least two '
+            'neighbors; terminal nodes use their incident edge [Default=1].'
         ),
     )
     optional.add_argument(
