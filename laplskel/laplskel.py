@@ -168,7 +168,7 @@ def _get_parser():
         '--solver',
         type=str,
         choices=VALID_SOLVER,
-        default='CG',
+        default='AMGCG',
         help=(
             'The solver to use to solve the linear system in computing the new '
             'coordinates system. LU uses SuperLU, a direct solver, CG uses Conjugate '
@@ -1098,10 +1098,6 @@ def laplacian_skeletonisation(
     else:
         n_workers = min(n_jobs, total_cores)
 
-    print(
-        f'Processing {num_features} components in parallel using {n_workers} worker(s) '
-        f'on {total_cores} CPU cores detected.'
-    )
     tasks = []
     task_metadata = []
 
@@ -1170,7 +1166,8 @@ def laplacian_skeletonisation(
             task_metadata.append({'slab_idx': slab_idx, 'slab_info': slab_info})
 
     print(
-        f'Processing components across {len(slabs)} slab(s) using {n_workers} worker(s).'
+        f'Processing components across {len(slabs)} slab(s) using {n_workers} worker(s) '
+        f'on {total_cores} CPU cores detected.'
     )
     raw_results = ParallelPbar('Skeletonising')(n_jobs=n_workers, batch_size=1)(tasks)
 
