@@ -194,6 +194,12 @@ def _get_parser():
         ),
     )
     optional.add_argument(
+        '--max_iter',
+        type=int,
+        default=2000,
+        help='Maximum number of iterations.',
+    )
+    optional.add_argument(
         '--downsample',
         action='store_true',
         help='Downsample the original matrix to preserve RAM.',
@@ -717,6 +723,7 @@ def _process_single_label(
     w_H_base,
     tol,
     max_distance,
+    max_iter,
     decimate_every,
     min_edge_length,
     solver,
@@ -805,6 +812,7 @@ def _process_single_label(
         w_H_base=w_H_base,
         tol=tol,
         decimate_every=decimate_every,
+        max_iter=max_iter,
         min_edge_length=min_edge_length,
         solver=solver,
     )
@@ -985,6 +993,7 @@ def laplacian_skeletonisation(
     w_H_base=0.5,
     tol=0.05,
     decimate_every=0.93,
+    max_iter=2000,
     min_edge_length=0.01,
     downsample=False,
     seed=42,
@@ -1133,6 +1142,7 @@ def laplacian_skeletonisation(
                         w_H_base,
                         tol,
                         max_distance,
+                        max_iter,
                         decimate_every,
                         min_edge_length,
                         solver,
@@ -1158,6 +1168,7 @@ def laplacian_skeletonisation(
                     w_H_base,
                     tol,
                     max_distance,
+                    max_iter,
                     decimate_every,
                     min_edge_length,
                     solver,
