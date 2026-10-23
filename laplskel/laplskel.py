@@ -48,7 +48,6 @@ def _get_parser():
     Returns
     -------
     parser.parse_args() : argparse dict
-
     """
     parser = argparse.ArgumentParser(
         description='Configurable EDT-Guided Laplacian Graph Contraction Pipeline.',
@@ -85,10 +84,7 @@ def _get_parser():
     optional.add_argument(
         '--use_anisotropic',
         action='store_true',
-        help=(
-            'Flag to disable anisotropic constraints and fall back to standard '
-            'isotropic Laplacian matrix operations.'
-        ),
+        help='Enable anisotropic constraints for Laplacian matrix operations.',
     )
     optional.add_argument(
         '--enforce_containment',
@@ -129,9 +125,9 @@ def _get_parser():
     optional.add_argument(
         '--decimate_every',
         dest='decimate_every',
-        type=int,
-        default=1,
-        help='Decimate nodes every N steps [Default=2].',
+        type=float,
+        default=0.93,
+        help='Decimate every N steps if integer, or when three consecutive mean-drift ratios lie in [ratio, 1] if float [Default=0.93].',
     )
     optional.add_argument(
         '--dec_grid_size',
@@ -186,7 +182,7 @@ def _get_parser():
         '--n_slabs',
         type=int,
         default=None,
-        help='Fixed number of slabs N to divide large labels (>= 700k voxels) into.',
+        help='Fixed number of slabs N to divide input image into.',
     )
     optional.add_argument(
         '--n_jobs',
@@ -421,7 +417,7 @@ def laplacian_graph_contraction(
     delta=0.5,
     max_iter=2000,
     tol=0.05,
-    decimate_every=1,
+    decimate_every=0.93,
     min_edge_length=0.01,
     alpha_norm=1.5,
     alpha_tang=0.1,
@@ -515,7 +511,6 @@ def laplacian_graph_contraction(
         enforce_containment = False
 
     edt_string = f' beta_edt (EDT scale factor)={beta_edt},' if use_edt else ''
-
     print(
         f'Starting contraction with {X.shape[0]} nodes \n\n'
         f'Params:\n'
@@ -527,6 +522,15 @@ def laplacian_graph_contraction(
         f' - Hard Containment={enforce_containment}\n'
         f' - Decimation step={decimate_every}\n'
     )
+
+    decimate_by_ratio = isinstance(decimate_every, float) and (
+        0.0 < decimate_every < 1.0
+    )
+    ratio_threshold = decimate_every if decimate_by_ratio else 0.93
+    decimate_interval = int(decimate_every) if not decimate_by_ratio else 1
+
+    prev_disp = None
+    drift_ratios = []
 
     for i in range(max_iter):
         n_vertices = X.shape[0]
@@ -553,8 +557,8 @@ def laplacian_graph_contraction(
 
             # Prevent divide-by-zero/negative issues from interpolation near boundary
             node_distances = np.maximum(node_distances, 0.0)
-
-            w_H_per_node = w_H_base * np.exp(beta_edt / (node_distances + delta))
+            # Anchoring towards the centreline (higher EDT increases retention weight)
+            w_H_per_node = w_H_base * np.exp(beta_edt * node_distances)
             W_H_sq = sparse.diags(w_H_per_node**2, format='csr')
             max_pull = f' - Max EDT w_H Pull: {np.max(w_H_per_node):.4f}'
         else:
@@ -657,8 +661,21 @@ def laplacian_graph_contraction(
             print('Convergence criteria reached.')
             break
 
-        if (i + 1) % decimate_every == 0:
-            X, adj = edge_collapse_decimation(X, adj, min_edge_length)
+        if decimate_by_ratio:
+            if prev_disp is not None and prev_disp > 1e-12:
+                r = displacement / prev_disp
+                drift_ratios.append(r)
+                if len(drift_ratios) > 3:
+                    drift_ratios.pop(0)
+                if len(drift_ratios) == 3 and all(
+                    ratio_threshold <= ratio <= 1.0 for ratio in drift_ratios
+                ):
+                    X, adj = edge_collapse_decimation(X, adj, min_edge_length)
+                    drift_ratios.clear()
+            prev_disp = displacement
+        else:
+            if (i + 1) % decimate_interval == 0:
+                X, adj = edge_collapse_decimation(X, adj, min_edge_length)
 
     return X, adj
 
@@ -702,7 +719,6 @@ def _process_single_label(
     max_distance,
     decimate_every,
     min_edge_length,
-    num_features,
     solver,
 ):
     """
@@ -761,7 +777,7 @@ def _process_single_label(
     final_adj : scipy.sparse.csr_matrix
         The resulting graph sparse adjacency connectivity representation of shape (M, M).
     """
-    X_init_local = np.argwhere(cropped_label).astype(np.uint16)
+    X_init_local = np.argwhere(cropped_label).astype(np.float32)
     tree = KDTree(X_init_local)
 
     # Skip small noise components
@@ -771,9 +787,7 @@ def _process_single_label(
         X_init_global = X_init_local + np.array(offset_origin, dtype=np.float32)
         return label_id, X_init_global, adj_sparse
 
-    print(
-        f'\n--- Processing Label {label_id}/{num_features} ({X_init_local.sum()} voxels) ---'
-    )
+    print(f'\n--- Processing Label {label_id} ({X_init_local.sum()} voxels) ---')
 
     print('Computing proximity network coordinates...')
     adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
@@ -842,40 +856,28 @@ def label_and_sort_by_size(binary_mask, label_connectivity=6):
     if num_features == 0:
         return labeled_volume, 0
 
-    sizes = ndimage.sum(
-        binary_mask,
-        labeled_volume,
-        index=np.arange(1, num_features + 1, dtype=np.int32),
+    counts = ndimage.sum(
+        binary_mask, labeled_volume, index=np.arange(1, num_features + 1)
     )
-    # Sort descending
-    sorted_indices = np.argsort(sizes)[::-1]
-    sorted_labels = sorted_indices + 1
-    sorted_sizes = sizes[sorted_indices]
+    sorted_labels = np.argsort(counts)[::-1] + 1
 
     mapping = np.zeros(num_features + 1, dtype=labeled_volume.dtype)
     mapping[sorted_labels] = np.arange(1, num_features + 1, dtype=labeled_volume.dtype)
 
-    return mapping[labeled_volume], num_features, sorted_sizes
+    return mapping[labeled_volume], num_features
 
 
-def _split_label_into_slabs(cropped_label, offset_origin, label_size, n_slabs=None):
-    """
-    Split a large cropped label along its longest dimension into overlapping slabs.
-    Overlap is set to 10% of the slab length.
-    """
-    if n_slabs is None or n_slabs <= 0:
-        n_slabs = int(np.ceil(label_size / 500000))
-    n_slabs = max(1, n_slabs)
-
-    shape = cropped_label.shape
+def _split_image_into_slabs(trimmed_volume, n_slabs=None):
+    """Split the trimmed input image into n_slabs slabs along the longest dimension with 5% overlap."""
+    shape = trimmed_volume.shape
     longest_dim = np.argmax(shape)
     axis_length = shape[longest_dim]
 
-    if n_slabs == 1 or axis_length < n_slabs:
-        return [(cropped_label, offset_origin, None)]
+    if n_slabs is None or n_slabs <= 1 or axis_length < n_slabs:
+        return [(trimmed_volume, (0, 0, 0), None)]
 
     base_slab_len = axis_length / n_slabs
-    overlap_len = base_slab_len * 0.10
+    overlap_len = base_slab_len * 0.05
 
     slabs = []
     for i in range(n_slabs):
@@ -889,13 +891,12 @@ def _split_label_into_slabs(cropped_label, offset_origin, label_size, n_slabs=No
         slab_slices = [slice(None)] * 3
         slab_slices[longest_dim] = slice(start_idx, end_idx)
 
-        slab_mask = cropped_label[tuple(slab_slices)]
+        slab_mask = trimmed_volume[tuple(slab_slices)]
         if not np.any(slab_mask):
             continue
 
-        # Adjust origin offset for the slab
-        slab_offset = list(offset_origin)
-        slab_offset[longest_dim] += start_idx
+        slab_offset = [0, 0, 0]
+        slab_offset[longest_dim] = start_idx
 
         # Calculate coordinate bounds relative to the slab's internal local space
         # representing the 50% overlap trim zones to drop during merge
@@ -957,12 +958,14 @@ def coords_to_dense_3d(X, volume_shape):
     """
     # 1. Initialize empty dense matrix
     dense_volume = np.zeros(volume_shape, dtype=bool)
+    if len(X) == 0:
+        return dense_volume
 
     coords = np.rint(X).astype(np.int64)
 
     # 2. Fix coordinates on boundaries due to numpy's round-to-even
     for dim, bound in enumerate(volume_shape):
-        coords[:, dim][coords[:, dim] == bound] = bound - 1
+        coords[:, dim] = np.clip(coords[:, dim], 0, bound - 1)
 
     # 3. Rasterize edges and nodes into the grid
     for i in coords:
@@ -981,7 +984,7 @@ def laplacian_skeletonisation(
     w_L=0.5,
     w_H_base=0.5,
     tol=0.05,
-    decimate_every=1,
+    decimate_every=0.93,
     min_edge_length=0.01,
     downsample=False,
     seed=42,
@@ -1072,25 +1075,22 @@ def laplacian_skeletonisation(
     if not np.any(volume_data):
         raise ValueError('Provided segmentation volume lacks any foreground structure.')
 
-    # Downsample points cloud initialization limits if necessary to guard RAM bounds
-    if downsample and np.any(volume_data) > 200000:
-        print(f'Volume contains {np.any(volume_data)} points. Downsampling.')
-        vessel_voxels = np.argwhere(volume_data).astype(np.uint16)
+    orig_shape = volume_data.shape
+
+    # 1. Internally trim empty edges
+    bbox = ndimage.find_objects(volume_data)[0]
+    trimmed_volume = volume_data[bbox]
+    trim_offset = (bbox[0].start, bbox[1].start, bbox[2].start)
+
+    if downsample and np.any(trimmed_volume) > 200000:
+        vessel_voxels = np.argwhere(trimmed_volume).astype(np.uint16)
         rng = np.random.default_rng(seed=seed)
         idx = rng.choice(len(vessel_voxels), 150000, replace=False)
         vessel_voxels = vessel_voxels[idx]
-        volume_data = coords_to_dense_3d(vessel_voxels, volume_data.shape)
+        trimmed_volume = coords_to_dense_3d(vessel_voxels, trimmed_volume.shape)
 
-    # Process each component independently if separate_streams is True
-    if separate_streams:
-        labeled_volume, num_features, label_sizes = label_and_sort_by_size(
-            volume_data, label_connectivity
-        )
-    else:
-        labeled_volume, num_features = volume_data * 1, 1
-        label_sizes = (
-            np.array([np.sum(volume_data)]) if np.any(volume_data) else np.array([0])
-        )
+    # 2. Split input image into n_slabs slabs
+    slabs = _split_image_into_slabs(trimmed_volume, n_slabs=n_slabs)
 
     total_cores = os.cpu_count() or 1
     if n_jobs is None or n_jobs <= 0:
@@ -1102,35 +1102,57 @@ def laplacian_skeletonisation(
         f'Processing {num_features} components in parallel using {n_workers} worker(s) '
         f'on {total_cores} CPU cores detected.'
     )
-
-    slices_list = ndimage.find_objects(labeled_volume)
-
     tasks = []
-    task_metadata = []  # Keep track of slab metadata for post-processing merge
+    task_metadata = []
 
-    for label_id in range(1, num_features + 1):
-        bbox_slice = slices_list[label_id - 1]
-
-        if bbox_slice is None:
+    for slab_idx, (slab_mask, slab_offset, slab_info) in enumerate(slabs):
+        if not np.any(slab_mask):
             continue
 
-        # Extract cropped boolean mask for ONLY this label
-        cropped_label = labeled_volume[bbox_slice] == label_id
-        label_size = label_sizes[label_id - 1]
-
-        # Offset origin (min_x, min_y, min_z) used to map back to original volume
-        offset_origin = (
-            bbox_slice[0].start,
-            bbox_slice[1].start,
-            bbox_slice[2].start,
-        )
-
-        # Labels < 700,000 are processed directly
-        if label_size < 700000:
+        if separate_streams:
+            labeled_slab, num_features = label_and_sort_by_size(
+                slab_mask, label_connectivity
+            )
+            slices_slab = ndimage.find_objects(labeled_slab)
+            for label_id in range(1, num_features + 1):
+                bbox_slice = slices_slab[label_id - 1]
+                if bbox_slice is None:
+                    continue
+                cropped_label = labeled_slab[bbox_slice] == label_id
+                offset_origin = (
+                    trim_offset[0] + slab_offset[0] + bbox_slice[0].start,
+                    trim_offset[1] + slab_offset[1] + bbox_slice[1].start,
+                    trim_offset[2] + slab_offset[2] + bbox_slice[2].start,
+                )
+                tasks.append(
+                    delayed(_process_single_label)(
+                        label_id,
+                        cropped_label,
+                        offset_origin,
+                        use_edt,
+                        use_anisotropic,
+                        enforce_containment,
+                        beta_edt,
+                        w_L,
+                        w_H_base,
+                        tol,
+                        max_distance,
+                        decimate_every,
+                        min_edge_length,
+                        solver,
+                    )
+                )
+                task_metadata.append({'slab_idx': slab_idx, 'slab_info': slab_info})
+        else:
+            offset_origin = (
+                trim_offset[0] + slab_offset[0],
+                trim_offset[1] + slab_offset[1],
+                trim_offset[2] + slab_offset[2],
+            )
             tasks.append(
                 delayed(_process_single_label)(
-                    label_id,
-                    cropped_label,
+                    1,
+                    slab_mask,
                     offset_origin,
                     use_edt,
                     use_anisotropic,
@@ -1142,39 +1164,14 @@ def laplacian_skeletonisation(
                     max_distance,
                     decimate_every,
                     min_edge_length,
-                    num_features,
                     solver,
                 )
             )
-            task_metadata.append({'label_id': label_id, 'slab_info': None})
-        else:
-            # Labels >= 700,000 are split into overlapping slabs along longest dim
-            slabs = _split_label_into_slabs(
-                cropped_label, offset_origin, label_size, n_slabs=n_slabs
-            )
-            for slab_mask, slab_offset, slab_info in slabs:
-                tasks.append(
-                    delayed(_process_single_label)(
-                        label_id,
-                        slab_mask,
-                        slab_offset,
-                        use_edt,
-                        use_anisotropic,
-                        enforce_containment,
-                        beta_edt,
-                        w_L,
-                        w_H_base,
-                        tol,
-                        max_distance,
-                        decimate_every,
-                        min_edge_length,
-                        num_features,
-                        solver,
-                    )
-                )
-                task_metadata.append({'label_id': label_id, 'slab_info': slab_info})
+            task_metadata.append({'slab_idx': slab_idx, 'slab_info': slab_info})
 
-    # Run workers in parallel
+    print(
+        f'Processing components across {len(slabs)} slab(s) using {n_workers} worker(s).'
+    )
     raw_results = ParallelPbar('Skeletonising')(n_jobs=n_workers, batch_size=1)(tasks)
 
     print('Reuniting and trimming overlapping slab results from parallel jobs.')
@@ -1182,20 +1179,27 @@ def laplacian_skeletonisation(
     if not raw_results:
         raise ValueError('No valid components found for contraction.')
 
-    # Merge coordinates and sparse block-diagonal adjacency matrices across all labels
+    # Group results by slab index to export individual slabs as well as the full reconstruction
+    slab_processed_X = {i: [] for i in range(len(slabs))}
+    slab_processed_adj = {i: [] for i in range(len(slabs))}
+
     processed_X = []
     processed_adj = []
 
     for res, meta in zip(raw_results, task_metadata):
         _, X_global, adj = res
+        slab_idx = meta['slab_idx']
         trimmed_X, trimmed_adj = _trim_slab_overlap(X_global, adj, meta['slab_info'])
         if len(trimmed_X) > 0:
             processed_X.append(trimmed_X)
             processed_adj.append(trimmed_adj)
+            slab_processed_X[slab_idx].append(trimmed_X)
+            slab_processed_adj[slab_idx].append(trimmed_adj)
 
     # Merge coordinates and sparse block-diagonal adjacency matrices across all items
     contracted_X = np.vstack(processed_X)
     final_adj = sparse.block_diag(processed_adj, format='csr')
+
     out_path = (
         out_path
         if out_path
@@ -1205,20 +1209,27 @@ def laplacian_skeletonisation(
     print(f'\nSaving structural centerline data matrices to: {out_path}')
     np.savez_compressed(f'{out_path}_coords.npz', contracted_X=contracted_X)
     sparse.save_npz(f'{out_path}.npz', final_adj)
-    nifti_skel = coords_to_dense_3d(contracted_X, volume_data.shape)
 
-    # If enforce containment was used, assume no loss of tracts masking with original segmentation.
+    # Export reconstructed full image
+    nifti_skel = coords_to_dense_3d(contracted_X, orig_shape)
     if enforce_containment:
-        nifti_skel = nifti_skel * volume_data
-
+        # Load full mask back for containment if needed
+        _, full_mask, _ = io.load_nifti_get_mask(nifti_path, is_mask=True, ndim=3)
+        nifti_skel = nifti_skel * full_mask
     io.export_nifti(nifti_skel, img, f'{out_path}.nii.gz')
+
+    # Export individual slabs in original volume dimensions (empty outside of the slab)
+    for slab_idx, x_list in slab_processed_X.items():
+        if len(x_list) > 0:
+            slab_X_combined = np.vstack(x_list)
+            slab_dense = coords_to_dense_3d(slab_X_combined, orig_shape)
+            io.export_nifti(slab_dense, img, f'{out_path}_slab_{slab_idx + 1}.nii.gz')
 
     return contracted_X, final_adj, nifti_skel
 
 
 def _main(argv=None):
     args = _get_parser().parse_args(argv)
-
     laplacian_skeletonisation(**vars(args))
 
 
