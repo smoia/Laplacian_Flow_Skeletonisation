@@ -564,7 +564,7 @@ def laplacian_graph_contraction(
             # Prevent divide-by-zero/negative issues from interpolation near boundary
             node_distances = np.maximum(node_distances, 0.0)
             # Anchoring towards the centreline (higher EDT increases retention weight)
-            w_H_per_node = w_H_base * np.exp(beta_edt * node_distances)
+            w_H_per_node = w_H_base * np.exp(beta_edt / (node_distances + delta))
             W_H_sq = sparse.diags(w_H_per_node**2, format='csr')
             max_pull = f' - Max EDT w_H Pull: {np.max(w_H_per_node):.4f}'
         else:
