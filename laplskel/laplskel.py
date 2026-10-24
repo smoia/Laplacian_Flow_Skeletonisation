@@ -308,6 +308,7 @@ def compute_laplacian_matrix(
             )
             tangents = np.zeros((n_vertices, 3), dtype=X.dtype)
             tangents[:, 0] = 1.0
+            eigvals = np.ones((n_vertices, 3), dtype=X.dtype)
 
         # Fallback for isolated vertices/single neighbors: default to [1, 0, 0]
         fallback_mask = (
