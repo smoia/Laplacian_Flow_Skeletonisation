@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import datetime
+import logging
 import os
 import sys
 
@@ -16,6 +18,9 @@ from . import _version
 
 VALID_CONNECTIVITY = (6, 18, 26)
 VALID_SOLVER = ('LU', 'CG', 'AMGCG')
+
+LGR = logging.getLogger(__name__)
+LGR.setLevel(logging.INFO)
 
 
 class UnionFind:
@@ -216,6 +221,24 @@ def _get_parser():
         '-h', '--help', action='help', help='Show this help message and exit'
     )
     optional.add_argument(
+        '-debug',
+        '--debug',
+        dest='verbose_level',
+        action='store_const',
+        const='debug',
+        help='Print debugging info to log file. Default is False.',
+        default='info',
+    )
+    optional.add_argument(
+        '-quiet',
+        '--quiet',
+        dest='verbose_level',
+        action='store_const',
+        const='quiet',
+        help='Only print warnings to log file. Default is False.',
+        default='info',
+    )
+    optional.add_argument(
         '-v',
         '--version',
         action='version',
@@ -310,8 +333,8 @@ def compute_laplacian_matrix(
             tangents = eigvecs[:, :, -1]
         except np.linalg.LinAlgError:
             # Adaptive fallback if bulk eigh fails due to numerical instability / LAPACK convergence limits
-            print(
-                'Warning: linalg.eigh convergence failure detected on degenerate '
+            LGR.warning(
+                'linalg.eigh convergence failure detected on degenerate '
                 'neighborhood. Applying safe fallback tangents.'
             )
             tangents = np.zeros((n_vertices, 3), dtype=X.dtype)
@@ -523,7 +546,7 @@ def laplacian_graph_contraction(
     closest_vessels_indices = None
 
     if (use_edt or enforce_containment) and binary_segmentation is not None:
-        print('Computing 3D EDT Map and boundary projection lookup tensors...')
+        LGR.info('Computing 3D EDT Map and boundary projection lookup tensors...')
         # Inverse transform tells background voxels how far they are from the foreground target mask
         background_edt, nearest_indices = ndimage.distance_transform_edt(
             binary_segmentation == 0, return_indices=True
@@ -532,14 +555,12 @@ def laplacian_graph_contraction(
         closest_vessels_indices = nearest_indices
         vol_shape = binary_segmentation.shape
     elif (use_edt or enforce_containment) and binary_segmentation is None:
-        print(
-            'Warning: No segmentation mask provided. Falling back to classic approach.'
-        )
+        LGR.warning('No segmentation mask provided. Falling back to classic approach.')
         use_edt = False
         enforce_containment = False
 
     edt_string = f' beta_edt (EDT scale factor)={beta_edt},' if use_edt else ''
-    print(
+    LGR.info(
         f'Starting contraction with {X.shape[0]} nodes \n\n'
         f'Params:\n'
         f' - w_L (\u03b1)={w_L}, w_H_base (\u03b2)={w_H_base}, tol (\u03b3)={tol},\n'
@@ -598,12 +619,10 @@ def laplacian_graph_contraction(
 
         # Check for infinite or NaNs values
         if not np.all(np.isfinite(A.data)) or not np.all(np.isfinite(B)):
-            print(
-                'Warning: Non-finite values detected in A or B. Cleaning matrix data...'
-            )
-            print(
+            LGR.warning(
+                'Non-finite values detected in A or B: '
                 f'Found {np.sum(~np.isfinite(A.data))} inf or NaNs in A and '
-                f'{np.sum(~np.isfinite(B))} in B'
+                f'{np.sum(~np.isfinite(B))} in B. Masking values.'
             )
             A.data[~np.isfinite(A.data)] = 0.0
             B[~np.isfinite(B)] = 0.0
@@ -616,8 +635,8 @@ def laplacian_graph_contraction(
             try:
                 import pyamg
             except ImportError:
-                print(
-                    '!!! WARNING: AMGCG solver was selected, but pyAMG is not '
+                LGR.warning(
+                    'AMGCG solver was selected, but pyAMG is not '
                     'installed. Switching solver to CG. !!!'
                 )
                 solver = 'CG'
@@ -628,11 +647,11 @@ def laplacian_graph_contraction(
                     A = A.copy()
                     A.indptr = A.indptr.astype(np.int32)
                     A.indices = A.indices.astype(np.int32)
-                    print('!!! WARNING: downcasting A indexes to int32 to use pyAMG')
+                    LGR.warning('downcasting A indexes to int32 to use pyAMG')
                 else:
                     # NNZ or shape exceeds int32 max limit (pyAMG C++ extensions will fail)
-                    print(
-                        '!!! WARNING: AMGCG solver was selected, but A has too many '
+                    LGR.warning(
+                        'AMGCG solver was selected, but A has too many '
                         'non-zero voxels or rows. Switching solver to CG for this '
                         'segment. !!!'
                     )
@@ -692,13 +711,13 @@ def laplacian_graph_contraction(
         displacement = np.mean(np.linalg.norm(X_next - X, axis=1))
         X = X_next
 
-        print(
+        LGR.info(
             f'Iter {i + 1}/{max_iter} - Remaining Nodes: {X.shape[0]} - '
             f'Error Drift: {displacement:.5f}{max_pull}'
         )
 
         if displacement < tol:
-            print('Convergence criteria reached.')
+            LGR.info('Convergence criteria reached.')
             break
 
         if decimate_by_ratio:
@@ -818,42 +837,47 @@ def _process_single_label(
     final_adj : scipy.sparse.csr_matrix
         The resulting graph sparse adjacency connectivity representation of shape (M, M).
     """
-    X_init_local = np.argwhere(cropped_label).astype(np.float64)
-    tree = KDTree(X_init_local)
+    try:
+        X_init_local = np.argwhere(cropped_label).astype(np.float64)
+        tree = KDTree(X_init_local)
 
-    # Skip small noise components
-    if len(X_init_local) <= 3:
+        # Skip small noise components
+        if len(X_init_local) <= 3:
+            adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
+
+            X_init_global = X_init_local + np.array(offset_origin, dtype=np.float64)
+            return label_id, X_init_global, adj_sparse
+
+        LGR.info(f'\n--- Processing Label {label_id} ({X_init_local.sum()} voxels) ---')
+
+        LGR.info('Computing proximity network coordinates...')
         adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
 
-        X_init_global = X_init_local + np.array(offset_origin, dtype=np.float64)
-        return label_id, X_init_global, adj_sparse
+        # Run contraction on this label's component mask
+        label_X_local, label_adj = laplacian_graph_contraction(
+            X_init_local,
+            adj_sparse,
+            binary_segmentation=cropped_label,
+            use_edt=use_edt,
+            use_anisotropic=use_anisotropic,
+            enforce_containment=enforce_containment,
+            beta_edt=beta_edt,
+            w_L=w_L,
+            w_H_base=w_H_base,
+            tol=tol,
+            decimate_every=decimate_every,
+            max_iter=max_iter,
+            min_edge_length=min_edge_length,
+            solver=solver,
+        )
 
-    print(f'\n--- Processing Label {label_id} ({X_init_local.sum()} voxels) ---')
+        label_X_global = label_X_local + np.array(offset_origin, dtype=np.float64)
 
-    print('Computing proximity network coordinates...')
-    adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
+        return label_id, label_X_global, label_adj
 
-    # Run contraction on this label's component mask
-    label_X_local, label_adj = laplacian_graph_contraction(
-        X_init_local,
-        adj_sparse,
-        binary_segmentation=cropped_label,
-        use_edt=use_edt,
-        use_anisotropic=use_anisotropic,
-        enforce_containment=enforce_containment,
-        beta_edt=beta_edt,
-        w_L=w_L,
-        w_H_base=w_H_base,
-        tol=tol,
-        decimate_every=decimate_every,
-        max_iter=max_iter,
-        min_edge_length=min_edge_length,
-        solver=solver,
-    )
-
-    label_X_global = label_X_local + np.array(offset_origin, dtype=np.float64)
-
-    return label_id, label_X_global, label_adj
+    except Exception as e:
+        LGR.error(f'Error processing component label {label_id}: {e}', exc_info=True)
+        raise e
 
 
 def label_and_sort_by_size(binary_mask, label_connectivity=6):
@@ -890,7 +914,7 @@ def label_and_sort_by_size(binary_mask, label_connectivity=6):
         structure=ndimage.generate_binary_structure(3, CONN[label_connectivity]),
     )
 
-    print(
+    LGR.info(
         f'Divided volume into {num_features} distinct label components '
         f'({label_connectivity}-connectivity).'
     )
@@ -950,6 +974,8 @@ def _split_image_into_slabs(trimmed_volume, n_slabs=None):
             'cut_low': cut_low,
             'cut_high': cut_high,
         }
+
+        LGR.warning(f'Slab {i}: {slab_info}')
 
         slabs.append((slab_mask, tuple(slab_offset), slab_info))
 
@@ -1037,6 +1063,7 @@ def laplacian_skeletonisation(
     n_slabs=None,
     max_distance=2.4999,
     n_jobs=None,
+    verbose_level='info',
 ):
     """
     Load a NIfTI file volume image and perform geometric graph contraction skeletonisation.
@@ -1112,7 +1139,53 @@ def laplacian_skeletonisation(
     ValueError
         If the loaded structural NIfTI mask image is completely empty or lacks foreground elements.
     """
-    print(f'Ingesting NIfTI image: {nifti_path}')
+    # Set output path and create folder
+    out_path = (
+        out_path
+        if out_path
+        else f'{os.path.splitext(os.path.splitext(nifti_path)[0])[0]}_skel'
+    )
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    # Create logfile name
+    logname = os.path.join(
+        f'{out_dir}_laplskel_{datetime.datetime.now().strftime("%Y-%m-%dT%H%M%S")}.tsv'
+    )
+    # Set logging format
+    log_formatter = logging.Formatter(
+        '%(asctime)s\t%(name)-12s\t%(levelname)-8s\t%(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+    )
+
+    # Set up logging file and open it for writing
+    log_handler = logging.FileHandler(logname)
+    log_handler.setFormatter(log_formatter)
+
+    # Set up screen stream handler
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter('%(levelname)-10s %(message)s'))
+
+    if verbose_level == 'quiet':
+        log_handler.setLevel(logging.INFO)  # Log both INFO and WARNING to file
+        sh.setLevel(logging.WARNING)  # Only print WARNING to screen
+        LGR.setLevel(logging.INFO)
+    elif verbose_level == 'debug':
+        log_handler.setLevel(logging.DEBUG)  # Log DEBUG and above to file
+        sh.setLevel(logging.DEBUG)  # Print DEBUG and above to screen
+        LGR.setLevel(logging.DEBUG)
+    else:
+        log_handler.setLevel(logging.INFO)  # Log INFO and above to file
+        sh.setLevel(logging.INFO)  # Print INFO and above to screen
+        LGR.setLevel(logging.INFO)
+
+    LGR.handlers = [log_handler, sh]
+    LGR.propagate = False
+
+    LGR.info(f'Currently running laplskel version {_version.get_versions()["version"]}')
+
+    LGR.info(f'Ingesting NIfTI image: {nifti_path}')
     _, volume_data, img = io.load_nifti_get_mask(nifti_path, is_mask=True, ndim=3)
 
     if not np.any(volume_data):
@@ -1210,13 +1283,13 @@ def laplacian_skeletonisation(
             )
             task_metadata.append({'slab_idx': slab_idx, 'slab_info': slab_info})
 
-    print(
+    LGR.info(
         f'Processing components across {len(slabs)} slab(s) using {n_workers} worker(s) '
         f'on {total_cores} CPU cores detected.'
     )
     raw_results = ParallelPbar('Skeletonising')(n_jobs=n_workers, batch_size=1)(tasks)
 
-    print('Reuniting and trimming overlapping slab results from parallel jobs.')
+    LGR.info('Reuniting and trimming overlapping slab results from parallel jobs.')
 
     if not raw_results:
         raise ValueError('No valid components found for contraction.')
@@ -1242,13 +1315,7 @@ def laplacian_skeletonisation(
     contracted_X = np.vstack(processed_X)
     final_adj = sparse.block_diag(processed_adj, format='csr')
 
-    out_path = (
-        out_path
-        if out_path
-        else f'{os.path.splitext(os.path.splitext(nifti_path)[0])[0]}_skel'
-    )
-
-    print(f'\nSaving structural centerline data matrices to: {out_path}')
+    LGR.info(f'\nSaving structural centerline data matrices to: {out_path}')
     np.savez_compressed(f'{out_path}_coords.npz', contracted_X=contracted_X)
     sparse.save_npz(f'{out_path}.npz', final_adj)
 
@@ -1272,7 +1339,14 @@ def laplacian_skeletonisation(
 
 def _main(argv=None):
     args = _get_parser().parse_args(argv)
-    laplacian_skeletonisation(**vars(args))
+    try:
+        laplacian_skeletonisation(**vars(args))
+    except Exception as e:
+        LGR.error(
+            f'Fatal error encountered during skeletonization pipeline: {e}',
+            exc_info=True,
+        )
+        raise e
 
 
 if __name__ == '__main__':
