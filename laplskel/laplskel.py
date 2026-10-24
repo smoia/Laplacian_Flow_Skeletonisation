@@ -12,6 +12,8 @@ from scipy.sparse.linalg import cg, spsolve
 from scipy.spatial import KDTree
 from tqdm_joblib import ParallelPbar
 
+from . import _version
+
 VALID_CONNECTIVITY = (6, 18, 26)
 VALID_SOLVER = ('LU', 'CG', 'AMGCG')
 
@@ -212,6 +214,12 @@ def _get_parser():
     )
     optional.add_argument(
         '-h', '--help', action='help', help='Show this help message and exit'
+    )
+    optional.add_argument(
+        '-v',
+        '--version',
+        action='version',
+        version=('%(prog)s ' + _version.get_versions()['version']),
     )
     return parser
 
