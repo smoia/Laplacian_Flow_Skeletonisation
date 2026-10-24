@@ -5,6 +5,7 @@ import datetime
 import logging
 import os
 import sys
+from copy import deepcopy
 
 import numpy as np
 from joblib import delayed
@@ -328,18 +329,8 @@ def compute_laplacian_matrix(
 
         # Vectorized eigenvalue decomposition on tensor of shape (N, 3, 3)
         # eigvecs has shape (N, 3, 3); last column is the principal eigenvector
-        try:
-            eigvals, eigvecs = np.linalg.eigh(cov_tensor)
-            tangents = eigvecs[:, :, -1]
-        except np.linalg.LinAlgError:
-            # Adaptive fallback if bulk eigh fails due to numerical instability / LAPACK convergence limits
-            LGR.warning(
-                'linalg.eigh convergence failure detected on degenerate '
-                'neighborhood. Applying safe fallback tangents.'
-            )
-            tangents = np.zeros((n_vertices, 3), dtype=X.dtype)
-            tangents[:, 0] = 1.0
-            eigvals = np.ones((n_vertices, 3), dtype=X.dtype)
+        eigvals, eigvecs = np.linalg.eigh(cov_tensor)
+        tangents = eigvecs[:, :, -1]
 
         # Fallback for isolated vertices/single neighbors: default to [1, 0, 0]
         fallback_mask = (
@@ -580,18 +571,30 @@ def laplacian_graph_contraction(
 
     prev_disp = None
     drift_ratios = []
+    X_previous = X
 
     for i in range(max_iter):
         n_vertices = X.shape[0]
 
         # 1. Compute chosen Laplacian variant
-        L = compute_laplacian_matrix(
-            X,
-            adj,
-            use_anisotropic=use_anisotropic,
-            alpha_norm=alpha_norm,
-            alpha_tang=alpha_tang,
-        )
+        try:
+            L = compute_laplacian_matrix(
+                X,
+                adj,
+                use_anisotropic=use_anisotropic,
+                alpha_norm=alpha_norm,
+                alpha_tang=alpha_tang,
+            )
+        except np.linalg.LinAlgError:
+            # Adaptive fallback if bulk eigh fails due to numerical instability / LAPACK convergence limits
+            LGR.warning(
+                'linalg.eigh convergence failure detected during Laplacian computation.'
+                ' Resetting previous running and switching to CG solver.'
+            )
+            solver = 'CG'
+            X = X_previous
+            continue
+
         L_squared = L.dot(L)
 
         # 2. Extract localized retention matrix mapping
@@ -624,8 +627,6 @@ def laplacian_graph_contraction(
                 f'Found {np.sum(~np.isfinite(A.data))} inf or NaNs in A and '
                 f'{np.sum(~np.isfinite(B))} in B. Masking values.'
             )
-            A.data[~np.isfinite(A.data)] = 0.0
-            B[~np.isfinite(B)] = 0.0
 
         # Select solver between LU, AMGCG, and CG, check solver only once entirely.
         check_solver = True
@@ -637,7 +638,7 @@ def laplacian_graph_contraction(
             except ImportError:
                 LGR.warning(
                     'AMGCG solver was selected, but pyAMG is not '
-                    'installed. Switching solver to CG. !!!'
+                    'installed. Switching solver to CG.'
                 )
                 solver = 'CG'
 
@@ -653,7 +654,7 @@ def laplacian_graph_contraction(
                     LGR.warning(
                         'AMGCG solver was selected, but A has too many '
                         'non-zero voxels or rows. Switching solver to CG for this '
-                        'segment. !!!'
+                        'segment.'
                     )
                     solver = 'CG'
 
@@ -709,6 +710,7 @@ def laplacian_graph_contraction(
                 max_pull += f' [Projected: {escaped_count} escaped nodes]'
 
         displacement = np.mean(np.linalg.norm(X_next - X, axis=1))
+        X_previous = deepcopy(X)
         X = X_next
 
         LGR.info(
