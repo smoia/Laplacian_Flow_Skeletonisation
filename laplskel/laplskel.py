@@ -596,6 +596,18 @@ def laplacian_graph_contraction(
         A = (w_L**2) * L_squared + W_H_sq
         B = W_H_sq.dot(X)
 
+        # Check for infinite or NaNs values
+        if not np.all(np.isfinite(A.data)) or not np.all(np.isfinite(B)):
+            print(
+                'Warning: Non-finite values detected in A or B. Cleaning matrix data...'
+            )
+            print(
+                f'Found {np.sum(~np.isfinite(A.data))} inf or NaNs in A and '
+                f'{np.sum(~np.isfinite(B))} in B'
+            )
+            A.data[~np.isfinite(A.data)] = 0.0
+            B[~np.isfinite(B)] = 0.0
+
         # Select solver between LU, AMGCG, and CG, check solver only once entirely.
         check_solver = True
 
