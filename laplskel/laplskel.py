@@ -297,11 +297,24 @@ def compute_laplacian_matrix(
 
         # Vectorized eigenvalue decomposition on tensor of shape (N, 3, 3)
         # eigvecs has shape (N, 3, 3); last column is the principal eigenvector
-        eigvals, eigvecs = np.linalg.eigh(cov_tensor)
-        tangents = eigvecs[:, :, -1]
+        try:
+            eigvals, eigvecs = np.linalg.eigh(cov_tensor)
+            tangents = eigvecs[:, :, -1]
+        except np.linalg.LinAlgError:
+            # Adaptive fallback if bulk eigh fails due to numerical instability / LAPACK convergence limits
+            print(
+                'Warning: linalg.eigh convergence failure detected on degenerate '
+                'neighborhood. Applying safe fallback tangents.'
+            )
+            tangents = np.zeros((n_vertices, 3), dtype=X.dtype)
+            tangents[:, 0] = 1.0
 
         # Fallback for isolated vertices/single neighbors: default to [1, 0, 0]
-        fallback_mask = degrees <= 1
+        fallback_mask = (
+            (degrees <= 1)
+            | np.any(eigvals < 1e-10, axis=1)
+            | np.any(np.isnan(tangents), axis=1)
+        )
         if np.any(fallback_mask):
             tangents[fallback_mask] = np.array([1.0, 0.0, 0.0])
 
@@ -784,14 +797,14 @@ def _process_single_label(
     final_adj : scipy.sparse.csr_matrix
         The resulting graph sparse adjacency connectivity representation of shape (M, M).
     """
-    X_init_local = np.argwhere(cropped_label).astype(np.float32)
+    X_init_local = np.argwhere(cropped_label).astype(np.float64)
     tree = KDTree(X_init_local)
 
     # Skip small noise components
     if len(X_init_local) <= 3:
         adj_sparse = compute_sparse_adjacency_matrix(tree, max_distance)
 
-        X_init_global = X_init_local + np.array(offset_origin, dtype=np.float32)
+        X_init_global = X_init_local + np.array(offset_origin, dtype=np.float64)
         return label_id, X_init_global, adj_sparse
 
     print(f'\n--- Processing Label {label_id} ({X_init_local.sum()} voxels) ---')
@@ -817,7 +830,7 @@ def _process_single_label(
         solver=solver,
     )
 
-    label_X_global = label_X_local + np.array(offset_origin, dtype=np.float32)
+    label_X_global = label_X_local + np.array(offset_origin, dtype=np.float64)
 
     return label_id, label_X_global, label_adj
 
