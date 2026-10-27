@@ -7,7 +7,14 @@ from nigsp import io
 from scipy import sparse
 
 from .parallelisation import process_components
-from .utils import coords_to_dense_3d, label_and_sort_by_size, write_graphml
+from .refinement import foreground_topology
+from .utils import (
+    _edge_voxels,
+    _foreground_voxel,
+    coords_to_dense_3d,
+    label_and_sort_by_size,
+    write_graphml,
+)
 
 
 def laplacian_skeletonisation(
@@ -21,7 +28,7 @@ def laplacian_skeletonisation(
     w_H_base=0.5,
     w_H_medial=1.0,
     tol=0.05,
-    decimate_every=1,
+    decimate_ratio=0.93,
     min_edge_length=0.01,
     downsample=False,
     seed=42,
@@ -33,6 +40,11 @@ def laplacian_skeletonisation(
     n_jobs=None,
     graphml=False,
     merge_tolerance=0.25,
+    alternating=False,
+    contraction_steps=5,
+    alter_init_thinning=False,
+    dev_contra_graph=False,
+    second_fitting=False,
 ):
     """
     Load a NIfTI file volume image and perform geometric graph contraction skeletonisation.
@@ -51,8 +63,8 @@ def laplacian_skeletonisation(
         Enables anisotropic geometry handling to penalize internal longitudinal
         shortening vectors. Default is True.
     enforce_containment : bool, optional
-        If True, applies a hard projection constraint to force nodes drifting out of the
-        foreground mask onto the closest inner boundary shell surface voxel.
+        If True, snaps nodes outside continuous foreground voxel cubes to the nearest
+        foreground voxel centre before and during contraction.
         Default is False.
     beta_edt : float, optional
         Scaling modulation weight assigned to boundary energy calculation properties.
@@ -71,9 +83,11 @@ def laplacian_skeletonisation(
     tol : float, optional
         Maximum contraction displacement in voxel units, required for three
         consecutive steps without structural changes. Default is 0.05.
-    decimate_every : int, optional
-        Frequency cadence interval defining how many contraction loop steps occur before
-        triggering an edge-collapse decimation execution. Default is 1.
+    decimate_ratio : float, optional
+        Adaptive decimation threshold in (0, 1]. Edge-collapse decimation runs once
+        three consecutive mean-drift ratios (current / previous) lie in
+        [decimate_ratio, 1]. Ignored in alternating mode, which disables merging.
+        Default is 0.93.
     min_edge_length : float, optional
         The Euclidean spatial threshold criteria below which two connected nodes undergo
         structural merging, expressed as a fraction of the isotropic voxel length.
@@ -108,12 +122,37 @@ def laplacian_skeletonisation(
     merge_tolerance : float, optional
         Maximum branch polyline error in voxel units during final refinement.
         Zero retains reference sampling. All values preserve foreground tunnels
-        under 26-connectivity. Default is 0.25.
+        under 26-connectivity. In the standard workflow it is used only with
+        second_fitting. Default is 0.25.
+    alternating : bool, optional
+        Use the experimental fixed-schedule contraction/thinning workflow. It uses
+        the original physical EDT for ridge guidance, while the established workflow
+        remains the default. Default is False.
+    contraction_steps : int, optional
+        Maximum contraction steps per alternating cycle. Default is 5; ignored
+        by the established non-alternating workflow.
+    alter_init_thinning : bool, optional
+        Enable the initial branch reference, reference checks, critical-node
+        movement caps and containment in alternating mode. Default False.
+        Without it, thinning retains local topology and tip protection, while
+        fitted geometry is unconstrained. Ignored by the default workflow.
+
+    dev_contra_graph : bool, optional
+        Also export the contracted graph before thinning as
+        <output_stem>_intermediate.graphml beside the normal outputs.
+        Ignored in alternating mode.
+    second_fitting : bool, optional
+        In the standard workflow, fit the extracted skeleton graph and then
+        simplify its branches with merge_tolerance. If False, the graph keeps
+        every digital skeleton voxel centre as a node. Ignored in alternating
+        mode. Default is False.
 
     Returns
     -------
     contracted_X : numpy.ndarray
         An (M, 3) matrix mapping the continuous 3D spatial points along the skeleton path.
+        Without second_fitting in the standard workflow, these are the digital
+        skeleton voxel centres.
     final_adj : scipy.sparse.csr_matrix
         The resulting graph sparse adjacency connectivity representation of shape (M, M).
     nifti_skel : numpy.ndarray
@@ -126,6 +165,12 @@ def laplacian_skeletonisation(
     """
     if not np.isfinite(merge_tolerance) or merge_tolerance < 0:
         raise ValueError('merge_tolerance must be finite and >= 0.')
+    if not np.isfinite(decimate_ratio) or not 0 < decimate_ratio <= 1:
+        raise ValueError('decimate_ratio must be finite and in (0, 1].')
+    if alternating and (
+        not isinstance(contraction_steps, int) or contraction_steps < 1
+    ):
+        raise ValueError('contraction_steps must be a positive integer.')
     if separate_streams and label_connectivity != 26:
         raise ValueError(
             'Tunnel preservation requires --label_connectivity 26 '
@@ -160,11 +205,17 @@ def laplacian_skeletonisation(
         tol,
         init_graph_adj,
         local_pca_hops,
-        decimate_every,
+        decimate_ratio,
         min_edge_length,
         n_jobs,
         solver,
         merge_tolerance,
+        alternating,
+        img.header.get_zooms()[:3],
+        contraction_steps,
+        alter_init_thinning,
+        dev_contra_graph,
+        second_fitting,
     )
 
     print('Reuniting results from parallel jobs.')
@@ -177,9 +228,14 @@ def laplacian_skeletonisation(
     final_adj = sparse.block_diag([res[2] for res in results], format='csr')
     # Keep the digital reference and edge paths: rounding simplified straight
     # segments can create extra voxel loops even when graph topology is correct.
-    nifti_skel = coords_to_dense_3d(
-        np.vstack([res[3] for res in results]), volume_data.shape
-    )
+    digital_voxels = np.vstack([res[3] for res in results])
+    if alternating and alter_init_thinning and (
+        np.any(digital_voxels < 0)
+        or np.any(digital_voxels >= volume_data.shape)
+        or not np.all(volume_data[tuple(digital_voxels.astype(int).T)])
+    ):
+        raise RuntimeError('Digital skeleton leaves the original foreground.')
+    nifti_skel = coords_to_dense_3d(digital_voxels, volume_data.shape)
     edge_paths = {}
     node_offset = 0
     for result in results:
@@ -189,11 +245,56 @@ def laplacian_skeletonisation(
         })
         node_offset += len(result[1])
 
+    if alternating and alter_init_thinning:
+        original_topology = foreground_topology(volume_data)[:2]
+        if foreground_topology(nifti_skel)[:2] != original_topology:
+            raise RuntimeError(
+                'Assembled digital skeleton changed foreground topology.'
+            )
+        graph_components = sparse.csgraph.connected_components(
+            final_adj, directed=False
+        )[0]
+        graph_tunnels = final_adj.nnz // 2 - len(contracted_X) + graph_components
+        if (graph_components, graph_tunnels) != original_topology:
+            raise RuntimeError('Assembled graph changed foreground topology.')
+        edge_rows, edge_cols = sparse.triu(final_adj, k=1).nonzero()
+        expected_edges = set(zip(edge_rows.tolist(), edge_cols.tolist()))
+        if set(edge_paths) != expected_edges:
+            raise RuntimeError('Graph edge paths do not match assembled adjacency.')
+        if not np.all(np.isfinite(contracted_X)):
+            raise RuntimeError('Graph contains non-finite node coordinates.')
+        for point in contracted_X:
+            _foreground_voxel(point, volume_data.shape, volume_data)
+        for (u, v), path in edge_paths.items():
+            if (
+                len(path) < 2
+                or not np.all(np.isfinite(path))
+                or not np.allclose(path[0], contracted_X[u], atol=1e-8, rtol=0.0)
+                or not np.allclose(path[-1], contracted_X[v], atol=1e-8, rtol=0.0)
+            ):
+                raise RuntimeError(
+                    'Graph edge path endpoints or coordinates are invalid.'
+                )
+            for start, end in zip(path[:-1], path[1:]):
+                _edge_voxels(start, end, volume_data.shape, volume_data)
+
     out_path = (
         out_path
         if out_path
         else f'{os.path.splitext(os.path.splitext(nifti_path)[0])[0]}_skel'
     )
+
+    if dev_contra_graph and not alternating:
+        write_graphml(
+            np.vstack([res[5] for res in results]),
+            sparse.block_diag([res[6] for res in results], format='csr'),
+            component_labels=np.concatenate(
+                [np.full(len(res[5]), res[0], dtype=int) for res in results]
+            ),
+            affine=img.affine,
+            volume_shape=volume_data.shape,
+            output_path=f'{out_path}_intermediate.graphml',
+        )
 
     print(f'\nSaving structural centerline data matrices to: {out_path}')
     if graphml:
@@ -207,7 +308,9 @@ def laplacian_skeletonisation(
             affine=img.affine,
             volume_shape=volume_data.shape,
             output_path=f'{out_path}.graphml',
-            binary_segmentation=nifti_skel,
+            binary_segmentation=(
+                volume_data if alter_init_thinning else None
+            ) if alternating else volume_data,
             edge_paths=edge_paths,
         )
     else:

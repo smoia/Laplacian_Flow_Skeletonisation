@@ -63,6 +63,46 @@ def _get_parser():
         ),
     )
     optional.add_argument(
+        '--dev_contra_graph',
+        action='store_true',
+        help=(
+            'Also write the contracted graph before thinning as '
+            '<output_stem>_intermediate.graphml. Ignored with --alternating.'
+        ),
+    )
+    optional.add_argument(
+        '--second_fitting',
+        action='store_true',
+        help=(
+            'Fit the extracted skeleton graph and simplify its branches with '
+            '--merge_tolerance. By default the graph keeps every digital skeleton '
+            'voxel as a node. Ignored with --alternating.'
+        ),
+    )
+    optional.add_argument(
+        '--alternating',
+        action='store_true',
+        help=(
+            'Use the experimental fixed-schedule contraction/thinning workflow '
+            'with original-foreground EDT ridge guidance.'
+        ),
+    )
+    optional.add_argument(
+        '--alter_init_thinning',
+        action='store_true',
+        help=(
+            'With --alternating, build an initial branch reference and enable '
+            'reference preservation, critical-node movement caps and containment. '
+            'Without this flag, use default thinning rules and free graph fitting.'
+        ),
+    )
+    optional.add_argument(
+        '--contraction_steps',
+        type=_positive_integer,
+        default=5,
+        help='Maximum contraction iterations per --alternating cycle [Default=5].',
+    )
+    optional.add_argument(
         '--use_edt',
         action='store_true',
         help=(
@@ -84,8 +124,8 @@ def _get_parser():
         '--enforce_containment',
         action='store_true',
         help=(
-            'Apply a hard projection constraint to force nodes drifting out of the '
-            'foreground mask onto the closest inner boundary shell surface voxel.'
+            'Snap nodes outside continuous foreground voxel cubes to the nearest '
+            'foreground voxel centre before and during contraction.'
         ),
     )
     optional.add_argument(
@@ -129,11 +169,14 @@ def _get_parser():
         help='Maximum contraction movement in voxels, required for three stable steps.',
     )
     optional.add_argument(
-        '--decimate_every',
-        dest='decimate_every',
-        type=int,
-        default=1,
-        help='Decimate nodes every N steps [Default=1].',
+        '--decimate_ratio',
+        dest='decimate_ratio',
+        type=float,
+        default=0.93,
+        help=(
+            'Decimate once three consecutive mean-drift ratios (current/previous) '
+            'lie in [ratio, 1]; must be in (0, 1] [Default=0.93].'
+        ),
     )
     optional.add_argument(
         '--dec_grid_size',
@@ -141,8 +184,9 @@ def _get_parser():
         type=float,
         default=0.01,
         help=(
-            'Maximum intermediate merge-cluster diameter in voxel units. '
-            'Final branch simplification uses --merge_tolerance.'
+            'Maximum intermediate merge-cluster diameter in voxel units, used by '
+            'contraction-stage decimation. Final branch simplification uses '
+            '--merge_tolerance.'
         ),
     )
     optional.add_argument(
@@ -153,7 +197,8 @@ def _get_parser():
             'Maximum branch simplification error in voxels [Default=0.25]. '
             '0 retains reference sampling; every foreground tunnel is preserved '
             'at every setting using 26-connectivity. Higher values allow more aggressive simplification, '
-            'subject to foreground and topology constraints.'
+            'subject to foreground and topology constraints. Without --alternating, '
+            'used only with --second_fitting.'
         ),
     )
     optional.add_argument(

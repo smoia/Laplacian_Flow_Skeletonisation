@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 from scipy import ndimage, sparse
 from scipy.sparse.linalg import cg, spsolve
+from scipy.spatial import cKDTree
 
 from .graph import compute_laplacian_matrix
 from .medial import compute_medialness
@@ -134,6 +135,25 @@ def edge_collapse_decimation(
     return new_X, new_adj, new_medialness
 
 
+def _project_escaped_nodes(points, foreground_tree):
+    """Snap points outside closed foreground voxel cubes to nearest centres."""
+    if not np.all(np.isfinite(points)):
+        raise ValueError('Containment requires finite node coordinates.')
+
+    # The nearest centre under the maximum-coordinate distance identifies cube
+    # membership, including face, edge and corner contacts.
+    cube_distances, _ = foreground_tree.query(points, p=np.inf, eps=0)
+    escaped = cube_distances > 0.5 + 1e-9
+    count = int(np.count_nonzero(escaped))
+    if not count:
+        return points, 0
+
+    projected = points.copy()
+    _, nearest = foreground_tree.query(points[escaped], p=2, eps=0)
+    projected[escaped] = foreground_tree.data[nearest]
+    return projected, count
+
+
 def laplacian_graph_contraction(
     X_init,
     adj_init,
@@ -148,12 +168,13 @@ def laplacian_graph_contraction(
     delta=0.5,
     max_iter=2000,
     tol=0.05,
-    decimate_every=1,
+    decimate_ratio=0.93,
     min_edge_length=0.01,
     alpha_norm=1.5,
     alpha_tang=0.1,
     local_pca_hops=1,
     solver='CG',
+    provisional=False,
 ):
     """
     Carry out Laplacian Flow Dynamics.
@@ -176,8 +197,8 @@ def laplacian_graph_contraction(
         If True, applies directionally weighted affinity rules prioritizing cross-sectional
         radial contraction over structural longitudinal shrinkage. Default is True.
     enforce_containment : bool, optional
-        If True, applies a hard projection constraint to force nodes drifting out of the
-        foreground mask onto the closest inner boundary shell surface voxel. Default is False.
+        If True, snaps nodes outside the continuous foreground voxel cubes to the
+        nearest foreground voxel centre before and during contraction. Default is False.
     w_L : float, optional
         Contraction weight coefficient forcing nodes toward localized neighborhood geometric centers.
         Default is 0.5.
@@ -201,12 +222,16 @@ def laplacian_graph_contraction(
     tol : float, optional
         Maximum vertex displacement tolerance in voxel units. Three stable steps
         without structural changes are required. Default is 0.05.
-    decimate_every : int, optional
-        Frequency cadence interval defining how many contraction loop steps occur before triggering
-        an edge-collapse decimation execution. Default is 1.
+    decimate_ratio : float, optional
+        Adaptive decimation threshold in (0, 1]. Drift is the mean node displacement
+        after containment projection. Edge-collapse decimation runs once three
+        consecutive drift ratios (current / previous) lie in [decimate_ratio, 1],
+        i.e. on the fourth valid drift. Failed solves and zero drift clear the ratio
+        history, and every decimation attempt resets it. Small-step and final-iteration
+        decimation are unchanged. Default is 0.93.
     min_edge_length : float, optional
         The Euclidean spatial threshold criteria below which two connected nodes undergo structural merging.
-        Default is 0.01.
+        A nonpositive value disables merging and the adaptive trigger. Default is 0.01.
     alpha_norm : float, optional
         The normal/cross-sectional penalty parameter used during anisotropic calculation phases.
         Default is 1.5.
@@ -222,6 +247,10 @@ def laplacian_graph_contraction(
         data, AMGCG constructs an Algebraic Multigrid (AMG) preconditioner before
         running CG, which makes it faster, but may require a tad more memory.
         Default is CG.
+    provisional : bool, optional
+        If True, treat ``max_iter`` as an intentional bounded contraction stage and
+        do not warn when that stage ends before geometric convergence. Default is
+        False. This does not change the numerical update or convergence test.
 
     Returns
     -------
@@ -233,39 +262,43 @@ def laplacian_graph_contraction(
     Raises
     ------
     ValueError
-        If `w_H_medial` is smaller than 1.0.
+        If `w_H_medial` is smaller than 1.0 or `decimate_ratio` is outside (0, 1].
     """
     if not np.isfinite(w_H_medial) or w_H_medial < 1.0:
         raise ValueError('w_H_medial must be finite and >= 1.0.')
     if solver not in ('CG', 'AMGCG', 'LU'):
         raise ValueError('solver must be CG, AMGCG, or LU.')
-    if max_iter < 1 or decimate_every < 1:
-        raise ValueError('max_iter and decimate_every must be positive.')
+    if max_iter < 1:
+        raise ValueError('max_iter must be positive.')
+    if not np.isfinite(decimate_ratio) or not 0 < decimate_ratio <= 1:
+        raise ValueError('decimate_ratio must be finite and in (0, 1].')
 
     X = X_init.copy().astype(float)
     adj = adj_init.copy()
 
-    # Conditional 3D EDT & Hard-Voxel Constraint Lookup Precomputation
+    # Prepare containment and optional EDT guidance.
     edt_volume = None
-    closest_vessels_indices = None
+    foreground_tree = None
     medialness = None
 
-    needs_edt = use_edt or enforce_containment or w_H_medial > 1.0
+    needs_edt = use_edt or w_H_medial > 1.0
 
-    if needs_edt and binary_segmentation is not None:
-        print('Computing 3D EDT Map and boundary projection lookup tensors...')
-        edt_volume = ndimage.distance_transform_edt(binary_segmentation)
-        vol_shape = binary_segmentation.shape
-
+    if binary_segmentation is not None:
         if enforce_containment:
-            # Inverse transform tells background voxels how far they are from the foreground target mask
-            _, closest_vessels_indices = ndimage.distance_transform_edt(
-                binary_segmentation == 0, return_indices=True
-            )
+            foreground_centres = np.argwhere(binary_segmentation)
+            if not len(foreground_centres):
+                raise ValueError('Containment requires a nonempty foreground mask.')
+            foreground_tree = cKDTree(foreground_centres)
+            X, initial_count = _project_escaped_nodes(X, foreground_tree)
+            if initial_count:
+                print(f'Projected {initial_count} initial escaped nodes to foreground centres.')
 
+        if needs_edt:
+            print('Computing 3D EDT Map...')
+            edt_volume = ndimage.distance_transform_edt(binary_segmentation)
         if w_H_medial > 1.0:
             medialness = compute_medialness(edt_volume, X)
-    elif needs_edt and binary_segmentation is None:
+    elif needs_edt or enforce_containment:
         print(
             'Warning: No segmentation mask provided. Falling back to classic approach.'
         )
@@ -285,10 +318,12 @@ def laplacian_graph_contraction(
         f' - EDT={use_edt}\n'
         f' - Medial Boost={w_H_medial if medialness is not None else False}\n'
         f' - Hard Containment={enforce_containment}\n'
-        f' - Decimation step={decimate_every}\n'
+        f' - Decimation ratio={decimate_ratio}\n'
     )
 
     stable_steps = 0
+    previous_drift = None
+    qualifying_ratios = []
     for i in range(max_iter):
         n_vertices = X.shape[0]
 
@@ -428,60 +463,76 @@ def laplacian_graph_contraction(
         if not np.all(np.isfinite(X_next)):
             raise RuntimeError('Contraction produced non-finite coordinates.')
 
-        # 4. Explicit Hard-Voxel Containment Constraint Projection
+        # 4. Project nodes that have left the continuous foreground cubes.
         if enforce_containment:
-            # Record out-of-bounds positions before clipping for safe array lookup.
-            voxel_positions = np.rint(X_next).astype(np.intp)
-            volume_bounds = np.asarray(vol_shape)
-            out_of_bounds = np.any(
-                (voxel_positions < 0) | (voxel_positions >= volume_bounds), axis=1
-            )
-            lookup_positions = np.clip(voxel_positions, 0, volume_bounds - 1)
-            ix_next, iy_next, iz_next = lookup_positions.T
-
-            escaped_mask = out_of_bounds | (
-                binary_segmentation[ix_next, iy_next, iz_next] == 0
-            )
-            escaped_count = np.sum(escaped_mask)
-
-            if escaped_count > 0:
-                # Extract precomputed closest coordinate index maps for escaped nodes
-                proj_x = closest_vessels_indices[0][
-                    ix_next[escaped_mask], iy_next[escaped_mask], iz_next[escaped_mask]
-                ]
-                proj_y = closest_vessels_indices[1][
-                    ix_next[escaped_mask], iy_next[escaped_mask], iz_next[escaped_mask]
-                ]
-                proj_z = closest_vessels_indices[2][
-                    ix_next[escaped_mask], iy_next[escaped_mask], iz_next[escaped_mask]
-                ]
-
-                # Project continuous coordinates onto the target boundary shell voxels
-                X_next[escaped_mask] = np.stack(
-                    [proj_x, proj_y, proj_z], axis=1
-                ).astype(float)
-                max_pull += f' [Projected: {escaped_count} escaped nodes]'
+            X_next, escaped_count = _project_escaped_nodes(X_next, foreground_tree)
+            if escaped_count:
+                max_pull += f' [Projected: {escaped_count} escaped nodes to centres]'
 
         movements = np.linalg.norm(X_next - X, axis=1)
         displacement = np.mean(movements)
         max_displacement = np.max(movements)
         X = X_next
 
+        # Adaptive decimation waits for the mean drift to plateau. Neither side of a
+        # ratio may come from a failed solve, and zero drift gives no ratio at all.
+        ratio_string = ''
+        if not step_solved or displacement == 0:
+            previous_drift, qualifying_ratios = None, []
+        else:
+            if previous_drift is not None:
+                ratio = displacement / previous_drift
+                if decimate_ratio <= ratio <= 1:
+                    qualifying_ratios.append(ratio)
+                else:
+                    qualifying_ratios = []
+                ratio_string = (
+                    f' - Drift Ratio: {ratio:.5f} (streak {len(qualifying_ratios)})'
+                )
+            previous_drift = displacement
+
         print(
             f'Iter {i + 1}/{max_iter} - Remaining Nodes: {X.shape[0]} - '
-            f'Mean Drift: {displacement:.5f} - Max Drift: {max_displacement:.5f}{max_pull}'
+            f'Mean Drift: {displacement:.5f} - Max Drift: {max_displacement:.5f}'
+            f'{ratio_string}{max_pull}'
         )
 
         small_step = max_displacement < tol and step_solved
-        if (i + 1) % decimate_every == 0 or small_step or i + 1 == max_iter:
+        # Without a positive merge length no edge can collapse, so a plateau gives
+        # adaptive decimation nothing to remove.
+        triggers = {
+            'adaptive': len(qualifying_ratios) >= 3 and min_edge_length > 0,
+            'small-step': small_step,
+            'final-iteration': i + 1 == max_iter,
+        }
+        if any(triggers.values()):
+            reasons = ', '.join(name for name, hit in triggers.items() if hit)
+            if triggers['adaptive']:
+                reasons += ' - Ratios: ' + ', '.join(
+                    f'{ratio:.5f}' for ratio in qualifying_ratios[-3:]
+                )
             X, adj, medialness = edge_collapse_decimation(
                 X, adj, min_edge_length, medialness=medialness, w_H_medial=w_H_medial
             )
+            if enforce_containment:
+                X, decimated_count = _project_escaped_nodes(X, foreground_tree)
+                if decimated_count:
+                    print(
+                        f'Projected {decimated_count} escaped nodes after decimation '
+                        'to foreground centres.'
+                    )
+            print(
+                f'Decimation at iter {i + 1} [{reasons}] - Removed Nodes: '
+                f'{n_vertices - X.shape[0]} - Remaining Nodes: {X.shape[0]}'
+            )
+            previous_drift, qualifying_ratios = None, []
         stable_steps = stable_steps + 1 if small_step and len(X) == n_vertices else 0
         if stable_steps >= 3:
             print('Contraction geometry stable.')
             break
     else:
+        if provisional:
+            return X, adj
         warnings.warn(
             'Contraction reached max_iter without stable geometry; these coordinates '
             'are provisional and require foreground-guided refinement.',

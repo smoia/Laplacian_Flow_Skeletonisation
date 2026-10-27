@@ -142,6 +142,13 @@ dmypy.json
 CLAUDE.md
 AGENTS.md
 LOG.md
+alternating_workflow.md
+
+# local dev doc
+WORKFLOW.md
+TEST_PLAN.md
 
 # test instances
 /tests/*
+/drafts/*
+/image/TEST_PLAN_0929/*
