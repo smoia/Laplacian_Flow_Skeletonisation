@@ -1196,7 +1196,7 @@ def laplacian_skeletonisation(
     orig_shape = volume_data.shape
 
     # 1. Internally trim empty edges
-    bbox = ndimage.find_objects(volume_data)[0]
+    bbox = ndimage.find_objects(volume_data * 1)[0]
     trimmed_volume = volume_data[bbox]
     trim_offset = (bbox[0].start, bbox[1].start, bbox[2].start)
 
