@@ -659,9 +659,9 @@ def laplacian_graph_contraction(
             W_H_sq = sparse.eye(n_vertices, format='csr') * (w_H_base**2)
 
         # 3. Solve Implicit Update System equations
-        LGR.warning('L_squared shape:', L_squared.shape)
-        LGR.warning('W_H_sq shape:', W_H_sq.shape)
-        LGR.warning('w_L shape:', np.shape(w_L))
+        LGR.warning(f'L_squared shape: {L_squared.shape}')
+        LGR.warning(f'W_H_sq shape: {W_H_sq.shape}')
+        LGR.warning(f'w_L shape: {np.shape(w_L)}')
         A = (w_L**2) * L_squared + W_H_sq
         B = W_H_sq.dot(X)
 
