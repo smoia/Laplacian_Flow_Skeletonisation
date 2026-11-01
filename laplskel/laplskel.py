@@ -90,6 +90,11 @@ def _get_parser():
         ),
     )
     optional.add_argument(
+        '--use_speed_contraction',
+        action='store_true',
+        help='Use speed contraction parameters to make center contract slower instead of EDT.',
+    )
+    optional.add_argument(
         '--use_anisotropic',
         action='store_true',
         help='Enable anisotropic constraints for Laplacian matrix operations.',
@@ -123,6 +128,12 @@ def _get_parser():
         type=float,
         default=0.5,
         help='Baseline structural anchor retention weight variable.',
+    )
+    optional.add_argument(
+        '--speed_factor',
+        type=float,
+        default=0.05,
+        help='Speed factor during contraction (Damseh gamma parameter) [Default=0.05].',
     )
     optional.add_argument(
         '--tol',
@@ -451,10 +462,12 @@ def laplacian_graph_contraction(
     adj_init,
     binary_segmentation=None,
     use_edt=True,
+    use_speed_contraction=False,
     use_anisotropic=True,
     enforce_containment=False,
     w_L=0.5,
     w_H_base=0.5,
+    speed_factor=0.05,
     beta_edt=1.0,
     delta=0.5,
     max_iter=2000,
@@ -534,31 +547,52 @@ def laplacian_graph_contraction(
 
     # Conditional 3D EDT & Hard-Voxel Constraint Lookup Precomputation
     edt_volume = None
+    norm_edt = None
     closest_vessels_indices = None
 
-    if (use_edt or enforce_containment) and binary_segmentation is not None:
+    if (
+        use_edt or use_speed_contraction or enforce_containment
+    ) and binary_segmentation is not None:
         LGR.info('Computing 3D EDT Map and boundary projection lookup tensors...')
+        edt_volume = ndimage.distance_transform_edt(binary_segmentation)
+        # Find value of EDT_volume by trilinear interpolation of new coordinates.
+        # map_coordinates expects shape (ndim, N), so pass X.T
+        node_distances = ndimage.map_coordinates(
+            edt_volume, X.T, order=1, mode='nearest'
+        )
+        # Prevent divide-by-zero/negative issues from interpolation near boundary
+        node_distances = np.maximum(node_distances, 0.0)
+    elif (
+        use_edt or use_speed_contraction or enforce_containment
+    ) and binary_segmentation is None:
+        LGR.warning('No segmentation mask provided. Falling back to classic approach.')
+        use_edt = False
+        enforce_containment = False
+        use_speed_contraction = False
+
+    if use_speed_contraction:
+        max_dist = np.max(edt_volume) if np.max(edt_volume) > 0 else 1.0
+        norm_edt = edt_volume / max_dist
+
+    if use_edt or enforce_containment:
         # Inverse transform tells background voxels how far they are from the foreground target mask
         background_edt, nearest_indices = ndimage.distance_transform_edt(
             binary_segmentation == 0, return_indices=True
         )
-        edt_volume = ndimage.distance_transform_edt(binary_segmentation)
         closest_vessels_indices = nearest_indices
         vol_shape = binary_segmentation.shape
-    elif (use_edt or enforce_containment) and binary_segmentation is None:
-        LGR.warning('No segmentation mask provided. Falling back to classic approach.')
-        use_edt = False
-        enforce_containment = False
 
     edt_string = f' beta_edt (EDT scale factor)={beta_edt},' if use_edt else ''
+    speed_string = f' speed (\u03b3)={speed_factor},' if use_speed_contraction else ''
     LGR.info(
         f'Starting contraction with {X.shape[0]} nodes \n\n'
         f'Params:\n'
-        f' - w_L (\u03b1)={w_L}, w_H_base (\u03b2)={w_H_base}, tol (\u03b3)={tol},\n'
+        f' - w_L (\u03b1)={w_L}, w_H_base (\u03b2)={w_H_base},{speed_string} tol={tol},\n'
         f' -{edt_string} min_edge_length (decimation grid)={min_edge_length}\n\n'
         f'Options:\n'
         f' - Anisotropic={use_anisotropic}\n'
         f' - EDT={use_edt}\n'
+        f' - Speed Contraction={use_speed_contraction}\n'
         f' - Hard Containment={enforce_containment}\n'
         f' - Decimation step={decimate_every}\n'
     )
@@ -600,19 +634,27 @@ def laplacian_graph_contraction(
         # 2. Extract localized retention matrix mapping
         max_pull = ''
 
-        if use_edt:
-            # Find value of EDT_volume by trilinear interpolation of new coordinates.
-            # map_coordinates expects shape (ndim, N), so pass X.T
-            node_distances = ndimage.map_coordinates(
-                edt_volume, X.T, order=1, mode='nearest'
-            )
-
-            # Prevent divide-by-zero/negative issues from interpolation near boundary
-            node_distances = np.maximum(node_distances, 0.0)
-            # Anchoring towards the centreline (higher EDT increases retention weight)
+        if use_edt and node_distances is not None:
             w_H_per_node = w_H_base * np.exp(beta_edt / (node_distances + delta))
             W_H_sq = sparse.diags(w_H_per_node**2, format='csr')
             max_pull = f' - Max EDT w_H Pull: {np.max(w_H_per_node):.4f}'
+
+        elif use_speed_contraction and node_distances is not None:
+            # Original Damseh approach although my threshold
+            core_threshold = (
+                np.percentile(node_distances, 50) if len(node_distances) > 0 else 1.0
+            )
+            is_skeletal_node = node_distances >= core_threshold
+
+            dist_vals = ndimage.map_coordinates(norm_edt, X.T, order=1, mode='nearest')
+            dist_vals = np.clip(dist_vals, 0.0, 1.0)
+
+            # 10 is the "alleviate param in the original code"
+            speed_values = (
+                ~is_skeletal_node
+            ) * speed_factor + is_skeletal_node * 10 * speed_factor
+            W_H_sq = sparse.diags(speed_values**2, format='csr')
+            max_pull = f' - Max Speed: {np.max(speed_values):.4f}'
         else:
             W_H_sq = sparse.eye(n_vertices, format='csr') * (w_H_base**2)
 
@@ -771,11 +813,13 @@ def _process_single_label(
     cropped_label,
     offset_origin,
     use_edt,
+    use_speed_contraction,
     use_anisotropic,
     enforce_containment,
     beta_edt,
     w_L,
     w_H_base,
+    speed_factor,
     tol,
     max_distance,
     max_iter,
@@ -861,11 +905,13 @@ def _process_single_label(
             adj_sparse,
             binary_segmentation=cropped_label,
             use_edt=use_edt,
+            use_speed_contraction=use_speed_contraction,
             use_anisotropic=use_anisotropic,
             enforce_containment=enforce_containment,
             beta_edt=beta_edt,
             w_L=w_L,
             w_H_base=w_H_base,
+            speed_factor=speed_factor,
             tol=tol,
             decimate_every=decimate_every,
             max_iter=max_iter,
@@ -1048,11 +1094,13 @@ def laplacian_skeletonisation(
     nifti_path,
     out_path=None,
     use_edt=True,
+    use_speed_contraction=False,
     use_anisotropic=True,
     enforce_containment=False,
     beta_edt=1.0,
     w_L=0.5,
     w_H_base=0.5,
+    speed_factor=0.05,
     tol=0.05,
     decimate_every=0.93,
     max_iter=2000,
@@ -1244,11 +1292,13 @@ def laplacian_skeletonisation(
                         cropped_label,
                         offset_origin,
                         use_edt,
+                        use_speed_contraction,
                         use_anisotropic,
                         enforce_containment,
                         beta_edt,
                         w_L,
                         w_H_base,
+                        speed_factor,
                         tol,
                         max_distance,
                         max_iter,
@@ -1270,11 +1320,13 @@ def laplacian_skeletonisation(
                     slab_mask,
                     offset_origin,
                     use_edt,
+                    use_speed_contraction,
                     use_anisotropic,
                     enforce_containment,
                     beta_edt,
                     w_L,
                     w_H_base,
+                    speed_factor,
                     tol,
                     max_distance,
                     max_iter,
