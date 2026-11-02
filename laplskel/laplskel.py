@@ -547,7 +547,6 @@ def laplacian_graph_contraction(
 
     # Conditional 3D EDT & Hard-Voxel Constraint Lookup Precomputation
     edt_volume = None
-    norm_edt = None
     closest_vessels_indices = None
 
     if (
@@ -569,10 +568,6 @@ def laplacian_graph_contraction(
         use_edt = False
         enforce_containment = False
         use_speed_contraction = False
-
-    if use_speed_contraction:
-        max_dist = np.max(edt_volume) if np.max(edt_volume) > 0 else 1.0
-        norm_edt = edt_volume / max_dist
 
     if use_edt or enforce_containment:
         # Inverse transform tells background voxels how far they are from the foreground target mask
@@ -605,7 +600,8 @@ def laplacian_graph_contraction(
 
     prev_disp = None
     drift_ratios = []
-    X_previous = X
+    X_previous = deepcopy(X)
+    adj_previous = deepcopy(adj)
 
     for i in range(max_iter):
         n_vertices = X.shape[0]
@@ -627,6 +623,7 @@ def laplacian_graph_contraction(
             )
             solver = 'CG'
             X = X_previous
+            adj = adj_previous
             continue
 
         L_squared = L.dot(L)
@@ -645,9 +642,6 @@ def laplacian_graph_contraction(
                 np.percentile(node_distances, 50) if len(node_distances) > 0 else 1.0
             )
             is_skeletal_node = node_distances >= core_threshold
-
-            dist_vals = ndimage.map_coordinates(norm_edt, X.T, order=1, mode='nearest')
-            dist_vals = np.clip(dist_vals, 0.0, 1.0)
 
             # 10 is the "alleviate param in the original code"
             speed_values = (
