@@ -1193,8 +1193,7 @@ def laplacian_skeletonisation(
         else f'{os.path.splitext(os.path.splitext(nifti_path)[0])[0]}_skel'
     )
     out_dir = os.path.dirname(out_path)
-    if out_dir and not os.path.exists(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
     # Create logfile name
     logname = os.path.join(
